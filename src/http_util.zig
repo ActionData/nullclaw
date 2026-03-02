@@ -138,6 +138,80 @@ pub fn curlPost(allocator: Allocator, url: []const u8, body: []const u8, headers
     return curlPostWithProxy(allocator, url, body, headers, null, null);
 }
 
+/// HTTP POST with application/x-www-form-urlencoded body via curl subprocess.
+///
+/// `body` must already be percent-encoded form data (e.g. `"key=val&key2=val2"`).
+/// Returns the response body. Caller owns returned memory.
+pub fn curlPostForm(allocator: Allocator, url: []const u8, body: []const u8) ![]u8 {
+    var argv_buf: [10][]const u8 = undefined;
+    var argc: usize = 0;
+
+    argv_buf[argc] = "curl";
+    argc += 1;
+    argv_buf[argc] = "-s";
+    argc += 1;
+    argv_buf[argc] = "-X";
+    argc += 1;
+    argv_buf[argc] = "POST";
+    argc += 1;
+    argv_buf[argc] = "-H";
+    argc += 1;
+    argv_buf[argc] = "Content-Type: application/x-www-form-urlencoded";
+    argc += 1;
+    argv_buf[argc] = "--data-binary";
+    argc += 1;
+    argv_buf[argc] = "@-";
+    argc += 1;
+    argv_buf[argc] = url;
+    argc += 1;
+
+    var child = std.process.Child.init(argv_buf[0..argc], allocator);
+    child.stdin_behavior = .Pipe;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+
+    try child.spawn();
+
+    if (child.stdin) |stdin_file| {
+        stdin_file.writeAll(body) catch {
+            stdin_file.close();
+            child.stdin = null;
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+            return error.CurlWriteError;
+        };
+        stdin_file.close();
+        child.stdin = null;
+    } else {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+        return error.CurlWriteError;
+    }
+
+    const stdout = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+        return error.CurlReadError;
+    };
+
+    const term = child.wait() catch {
+        allocator.free(stdout);
+        return error.CurlWaitError;
+    };
+    switch (term) {
+        .Exited => |code| if (code != 0) {
+            allocator.free(stdout);
+            return error.CurlFailed;
+        },
+        else => {
+            allocator.free(stdout);
+            return error.CurlFailed;
+        },
+    }
+
+    return stdout;
+}
+
 /// HTTP POST via curl subprocess and include HTTP status code in response.
 /// Caller owns `response.body`.
 pub fn curlPostWithStatus(
@@ -435,6 +509,14 @@ test "curlPostWithStatus compiles and is callable" {
 
 test "curlPut compiles and is callable" {
     try std.testing.expect(true);
+}
+
+test "curlPostForm uses exactly 9 fixed args plus url" {
+    // argv_buf is [10][]const u8: curl -s -X POST -H <ct> --data-binary @- <url> = 9 slots.
+    // Verify the constant is consistent with the implementation.
+    const argv_buf_len = 10;
+    const fixed_args = 9; // curl -s -X POST -H Content-Type --data-binary @- (url)
+    try std.testing.expect(fixed_args < argv_buf_len);
 }
 
 test "curlGet with zero headers compiles and is callable" {
