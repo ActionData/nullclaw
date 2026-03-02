@@ -2726,6 +2726,7 @@ test "slash /status returns agent info" {
     const response = (try agent.handleSlashCommand("/status")).?;
     defer allocator.free(response);
 
+    try std.testing.expect(std.mem.indexOf(u8, response, "🌊 NullClaw ") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "test-model") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "42") != null);
 }
@@ -2739,6 +2740,7 @@ test "slash /status can render without emojis" {
     const response = (try agent.handleSlashCommand("/status")).?;
     defer allocator.free(response);
 
+    try std.testing.expect(std.mem.indexOf(u8, response, "🌊") == null);
     try std.testing.expect(std.mem.indexOf(u8, response, "NullClaw") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "Model:") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "🧠") == null);
