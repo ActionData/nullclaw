@@ -109,13 +109,14 @@ fn parseMountinfoLine(line: []const u8, path: []const u8, best_len: *usize, best
     }
     const mount_point = it.next() orelse return;
 
-    // mount_point must be a prefix of path
-    if (!std.mem.startsWith(u8, path, mount_point)) return;
+    // mount_point in mountinfo uses octal escapes (for example "\040" for space).
+    // Decode while matching against `path` to avoid allocating.
+    const mount_point_len = mountPointDecodedPrefixLen(path, mount_point) orelse return;
     // Ensure it's a proper prefix (exact match, or next char is '/')
-    if (mount_point.len != path.len and mount_point.len > 1 and
-        (mount_point.len >= path.len or path[mount_point.len] != '/'))
+    if (mount_point_len != path.len and mount_point_len > 1 and
+        (mount_point_len >= path.len or path[mount_point_len] != '/'))
         return;
-    if (mount_point.len <= best_len.*) return;
+    if (mount_point_len <= best_len.*) return;
 
     // Find " - " separator to locate fs_type
     const sep = " - ";
@@ -124,8 +125,37 @@ fn parseMountinfoLine(line: []const u8, path: []const u8, best_len: *usize, best
     var sep_it = std.mem.splitScalar(u8, after_sep, ' ');
     const fs_type = sep_it.next() orelse return;
 
-    best_len.* = mount_point.len;
+    best_len.* = mount_point_len;
     best_is_network.* = isNetworkFs(fs_type);
+}
+
+fn mountPointDecodedPrefixLen(path: []const u8, mount_point: []const u8) ?usize {
+    var path_idx: usize = 0;
+    var mp_idx: usize = 0;
+    while (mp_idx < mount_point.len) {
+        if (mount_point[mp_idx] == '\\' and mp_idx + 3 < mount_point.len) {
+            const d1 = octalDigit(mount_point[mp_idx + 1]);
+            const d2 = octalDigit(mount_point[mp_idx + 2]);
+            const d3 = octalDigit(mount_point[mp_idx + 3]);
+            if (d1 != null and d2 != null and d3 != null) {
+                const decoded: u8 = (@as(u8, d1.?) << 6) | (@as(u8, d2.?) << 3) | d3.?;
+                if (path_idx >= path.len or path[path_idx] != decoded) return null;
+                path_idx += 1;
+                mp_idx += 4;
+                continue;
+            }
+        }
+
+        if (path_idx >= path.len or path[path_idx] != mount_point[mp_idx]) return null;
+        path_idx += 1;
+        mp_idx += 1;
+    }
+    return path_idx;
+}
+
+fn octalDigit(ch: u8) ?u8 {
+    if (ch < '0' or ch > '7') return null;
+    return ch - '0';
 }
 
 fn isNetworkFs(fs_type: []const u8) bool {
@@ -136,8 +166,26 @@ fn isNetworkFs(fs_type: []const u8) bool {
     return false;
 }
 
-/// Fallback: use the statfs syscall to check f_type.
+/// Fallback: use statfs to check f_type. If the DB file does not exist yet,
+/// retry on its parent directory.
 fn checkStatfs(path: [*:0]const u8) bool {
+    if (statfsSupportsWal(path)) |use_wal| return use_wal;
+
+    const path_span = std.mem.span(path);
+    if (path_span.len == 0 or std.mem.eql(u8, path_span, ":memory:")) return true;
+
+    const dir_path = std.fs.path.dirname(path_span) orelse ".";
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (dir_path.len + 1 > dir_buf.len) return true;
+    @memcpy(dir_buf[0..dir_path.len], dir_path);
+    dir_buf[dir_path.len] = 0;
+    const dir_z: [*:0]const u8 = @ptrCast(&dir_buf[0]);
+
+    if (statfsSupportsWal(dir_z)) |use_wal| return use_wal;
+    return true;
+}
+
+fn statfsSupportsWal(path: [*:0]const u8) ?bool {
     var buf: [15]usize = undefined;
     const rc = std.os.linux.syscall2(
         .statfs,
@@ -145,10 +193,10 @@ fn checkStatfs(path: [*:0]const u8) bool {
         @intFromPtr(&buf),
     );
     const signed_rc: isize = @bitCast(rc);
-    if (signed_rc < 0) return true; // statfs failed, assume WAL is fine
+    if (signed_rc < 0) return null;
 
-    const f_type = buf[0];
-    return switch (f_type) {
+    const f_magic: u32 = @truncate(buf[0]);
+    return switch (f_magic) {
         0x01021997, // V9FS_MAGIC
         0x6969, // NFS_SUPER_MAGIC
         0xFF534D42, // CIFS_MAGIC_NUMBER
@@ -943,6 +991,32 @@ pub const SqliteMemory = struct {
 };
 
 // ── Tests ──────────────────────────────────────────────────────────
+
+test "mountinfo parser decodes escaped mount point and picks network fs" {
+    const path = "/mnt/My Drive/work/memory.db";
+    const root_line = "24 1 0:21 / / rw,relatime - ext4 /dev/root rw";
+    const share_line = "36 24 0:31 / /mnt/My\\040Drive rw,relatime - 9p drvfs rw";
+
+    var best_len: usize = 0;
+    var best_is_network = false;
+    parseMountinfoLine(root_line, path, &best_len, &best_is_network);
+    parseMountinfoLine(share_line, path, &best_len, &best_is_network);
+
+    try std.testing.expect(best_len > 1);
+    try std.testing.expect(best_is_network);
+}
+
+test "mountinfo parser enforces directory boundary on prefix matches" {
+    const line = "36 24 0:31 / /mnt/share rw,relatime - 9p drvfs rw";
+    const path = "/mnt/share2/memory.db";
+
+    var best_len: usize = 0;
+    var best_is_network = false;
+    parseMountinfoLine(line, path, &best_len, &best_is_network);
+
+    try std.testing.expectEqual(@as(usize, 0), best_len);
+    try std.testing.expect(!best_is_network);
+}
 
 test "sqlite memory init with in-memory db" {
     var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
