@@ -200,6 +200,7 @@ pub const ToolsConfig = struct {
     shell_max_output_bytes: u32 = 1_048_576, // 1MB
     max_file_size_bytes: u32 = 10_485_760, // 10MB — shared file_read/edit/append
     web_fetch_max_chars: u32 = 100_000,
+    crm_db_path: ?[]const u8 = null,
 };
 
 pub const ModelRouteConfig = struct {
