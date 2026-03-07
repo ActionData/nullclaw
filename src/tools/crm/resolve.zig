@@ -134,10 +134,10 @@ pub fn formatCandidates(
     candidates: []MatchCandidate,
     entity_type: []const u8,
 ) ![]const u8 {
-    var buf = std.ArrayList(u8).init(allocator);
-    errdefer buf.deinit();
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
 
-    const writer = buf.writer();
+    const writer = buf.writer(allocator);
     try writer.print("Multiple {s}s found:\n", .{entity_type});
 
     for (candidates, 1..) |cand, i| {
@@ -149,7 +149,7 @@ pub fn formatCandidates(
     }
     try writer.writeAll("Which one did you mean?");
 
-    return buf.toOwnedSlice();
+    return buf.toOwnedSlice(allocator);
 }
 
 // ── Internal resolution helpers ────────────────────────────────────
@@ -291,14 +291,14 @@ fn queryByPattern(
         _ = c.sqlite3_bind_text(stmt, 2, cid.ptr, @intCast(cid.len), SQLITE_STATIC);
     }
 
-    var candidates = std.ArrayList(MatchCandidate).init(allocator);
+    var candidates: std.ArrayList(MatchCandidate) = .empty;
     errdefer {
         for (candidates.items) |cand| {
             allocator.free(cand.id);
             allocator.free(cand.name);
             allocator.free(cand.context);
         }
-        candidates.deinit();
+        candidates.deinit(allocator);
     }
 
     while (true) {
@@ -317,7 +317,7 @@ fn queryByPattern(
         const ctx = format_context(db, allocator, raw_id) orelse
             try allocator.dupe(u8, "");
 
-        try candidates.append(.{
+        try candidates.append(allocator, .{
             .id = id_copy,
             .name = name_copy,
             .match_type = match_type,
@@ -326,7 +326,7 @@ fn queryByPattern(
         });
     }
 
-    return candidates.toOwnedSlice();
+    return candidates.toOwnedSlice(allocator);
 }
 
 // ── Context formatting functions ───────────────────────────────────

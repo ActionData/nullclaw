@@ -95,6 +95,7 @@ pub const i2c = @import("i2c.zig");
 pub const spi = @import("spi.zig");
 pub const path_security = @import("path_security.zig");
 pub const process_util = @import("process_util.zig");
+pub const crm = @import("crm/root.zig");
 
 // ── Core types ──────────────────────────────────────────────────────
 
@@ -295,6 +296,7 @@ pub fn allTools(
         policy: ?*const @import("../security/policy.zig").SecurityPolicy = null,
         bootstrap_provider: ?bootstrap_mod.BootstrapProvider = null,
         backend_name: []const u8 = "hybrid",
+        crm_db_path: ?[]const u8 = null,
     },
 ) ![]Tool {
     var list: std.ArrayList(Tool) = .{};
@@ -451,6 +453,29 @@ pub fn allTools(
         const i2ct = try allocator.create(i2c.I2cTool);
         i2ct.* = .{};
         try list.append(allocator, i2ct.tool());
+    }
+
+    // CRM tools (Clawbber)
+    if (opts.crm_db_path) |db_path| {
+        const crm_db = try allocator.create(crm.CrmDb);
+        const db_path_z = try allocator.dupeZ(u8, db_path);
+        crm_db.* = try crm.CrmDb.init(allocator, db_path_z);
+
+        inline for (.{
+            crm.SaveContactTool,
+            crm.SaveCompanyTool,
+            crm.SaveDealTool,
+            crm.LogActivityTool,
+            crm.SearchCrmTool,
+            crm.GetContactTool,
+            crm.GetDealTool,
+            crm.UpdateDealStageTool,
+            crm.ListFollowupsTool,
+        }) |CrmToolType| {
+            const ct = try allocator.create(CrmToolType);
+            ct.* = .{ .db = crm_db };
+            try list.append(allocator, ct.tool());
+        }
     }
 
     // MCP tools (pre-initialized externally)

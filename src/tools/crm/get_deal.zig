@@ -94,9 +94,9 @@ pub const GetDealTool = struct {
         if (rc != c.SQLITE_OK) return root.ToolResult.fail("Failed to prepare deal query");
         defer _ = c.sqlite3_finalize(stmt);
 
-        const like_title = try std.fmt.allocPrintZ(allocator, "%{s}%", .{title});
+        const like_title = try std.fmt.allocPrint(allocator, "%{s}%", .{title});
         defer allocator.free(like_title);
-        _ = c.sqlite3_bind_text(stmt, 1, like_title.ptr, @intCast(like_title.len - 1), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 1, like_title.ptr, @intCast(like_title.len), SQLITE_STATIC);
 
         rc = c.sqlite3_step(stmt.?);
         if (rc != c.SQLITE_ROW) {
@@ -124,13 +124,13 @@ pub const GetDealTool = struct {
         if (rc != c.SQLITE_OK) return root.ToolResult.fail("Failed to prepare deal query");
         defer _ = c.sqlite3_finalize(stmt);
 
-        const like_company = try std.fmt.allocPrintZ(allocator, "%{s}%", .{company});
+        const like_company = try std.fmt.allocPrint(allocator, "%{s}%", .{company});
         defer allocator.free(like_company);
-        _ = c.sqlite3_bind_text(stmt, 1, like_company.ptr, @intCast(like_company.len - 1), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 1, like_company.ptr, @intCast(like_company.len), SQLITE_STATIC);
 
         // Collect all deals for this company
-        var result = std.ArrayList(u8).init(allocator);
-        errdefer result.deinit();
+        var result: std.ArrayList(u8) = .empty;
+        errdefer result.deinit(allocator);
 
         try result.appendSlice(allocator, "{\"deals\":[");
 
@@ -155,7 +155,7 @@ pub const GetDealTool = struct {
         }
 
         if (count == 0) {
-            result.deinit();
+            result.deinit(allocator);
             const msg = try std.fmt.allocPrint(allocator, "{{\"error\":\"No deals found for company '{s}'\"}}", .{company});
             return root.ToolResult{ .success = false, .output = msg };
         }
@@ -184,8 +184,8 @@ pub const GetDealTool = struct {
         const ct_name = columnText(stmt, 13);
         const ct_role = columnText(stmt, 14);
 
-        var result = std.ArrayList(u8).init(allocator);
-        errdefer result.deinit();
+        var result: std.ArrayList(u8) = .empty;
+        errdefer result.deinit(allocator);
 
         const deal_json = try std.fmt.allocPrint(allocator,
             \\{{"deal":{{"id":"{s}","title":"{s}","stage":"{s}","value":{d:.2},"currency":"{s}","close_date":"{s}","next_step":"{s}","notes":"{s}","created_at":"{s}","updated_at":"{s}"}},"company":{{"id":"{s}","name":"{s}"}},"contact":{{"id":"{s}","name":"{s}","role":"{s}"}},"recent_activities":[

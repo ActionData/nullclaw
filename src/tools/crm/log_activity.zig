@@ -159,9 +159,9 @@ pub const LogActivityTool = struct {
         rc = c.sqlite3_step(stmt.?);
         if (rc != c.SQLITE_ROW) return root.ToolResult.fail("Activity not found after save");
 
-        var buf = std.ArrayList(u8).init(allocator);
-        errdefer buf.deinit();
-        const w = buf.writer();
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(allocator);
+        const w = buf.writer(allocator);
 
         try w.writeAll("{\"status\":\"created\",\"activity\":{");
         try helpers.writeJsonField(w, "id", stmt, 0, true);
@@ -180,7 +180,7 @@ pub const LogActivityTool = struct {
         try helpers.writeJsonField(w, "created_at", stmt, 13, false);
         try w.writeAll("}}");
 
-        return root.ToolResult{ .success = true, .output = try buf.toOwnedSlice() };
+        return root.ToolResult{ .success = true, .output = try buf.toOwnedSlice(allocator) };
     }
 };
 

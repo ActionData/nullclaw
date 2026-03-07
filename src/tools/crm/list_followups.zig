@@ -35,8 +35,8 @@ pub const ListFollowupsTool = struct {
         const include_overdue = root.getBool(args, "include_overdue") orelse true;
 
         // Build query dynamically
-        var sql_buf = std.ArrayList(u8).init(allocator);
-        defer sql_buf.deinit();
+        var sql_buf: std.ArrayList(u8) = .empty;
+        defer sql_buf.deinit(allocator);
 
         try sql_buf.appendSlice(allocator,
             \\SELECT a.id, a.type, a.summary, a.date, a.follow_up_date, a.follow_up_note,
@@ -75,16 +75,16 @@ pub const ListFollowupsTool = struct {
         defer _ = c.sqlite3_finalize(stmt);
 
         // Bind days_ahead as text for the concatenation
-        const days_str = try std.fmt.allocPrintZ(allocator, "{d}", .{days_ahead});
+        const days_str = try std.fmt.allocPrint(allocator, "{d}", .{days_ahead});
         defer allocator.free(days_str);
-        _ = c.sqlite3_bind_text(stmt, 1, days_str.ptr, @intCast(days_str.len - 1), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 1, days_str.ptr, @intCast(days_str.len), SQLITE_STATIC);
 
         if (rep_id) |rid| {
             _ = c.sqlite3_bind_text(stmt, 2, rid.ptr, @intCast(rid.len), SQLITE_STATIC);
         }
 
-        var result = std.ArrayList(u8).init(allocator);
-        errdefer result.deinit();
+        var result: std.ArrayList(u8) = .empty;
+        errdefer result.deinit(allocator);
 
         try result.appendSlice(allocator, "{\"followups\":[");
 

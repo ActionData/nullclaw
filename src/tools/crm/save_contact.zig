@@ -93,10 +93,10 @@ pub const SaveContactTool = struct {
 
         _ = c.sqlite3_bind_text(stmt, 1, name.ptr, @intCast(name.len), schema.SQLITE_STATIC);
 
-        var list = std.ArrayList(Candidate).init(allocator);
+        var list: std.ArrayList(Candidate) = .empty;
         errdefer {
             for (list.items) |item| allocator.free(item.id);
-            list.deinit();
+            list.deinit(allocator);
         }
 
         while (c.sqlite3_step(stmt.?) == c.SQLITE_ROW) {
@@ -104,20 +104,20 @@ pub const SaveContactTool = struct {
             if (id_raw == null) continue;
             const id_copy = try allocator.dupe(u8, std.mem.span(id_raw));
 
-            try list.append(.{
+            try list.append(allocator, .{
                 .id = id_copy,
                 .name = c.sqlite3_column_text(stmt.?, 1),
                 .company_id = c.sqlite3_column_text(stmt.?, 2),
                 .role = c.sqlite3_column_text(stmt.?, 3),
             });
         }
-        return list.toOwnedSlice();
+        return list.toOwnedSlice(allocator);
     }
 
     fn buildDisambiguationResponse(allocator: std.mem.Allocator, name: []const u8, candidates: []const Candidate) !root.ToolResult {
-        var buf = std.ArrayList(u8).init(allocator);
-        errdefer buf.deinit();
-        const w = buf.writer();
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(allocator);
+        const w = buf.writer(allocator);
 
         try w.writeAll("{\"status\":\"disambiguation_needed\",\"message\":\"Multiple contacts match '");
         try helpers.writeJsonEscaped(w, name);
@@ -136,7 +136,7 @@ pub const SaveContactTool = struct {
             try w.writeByte('}');
         }
         try w.writeAll("]}");
-        return root.ToolResult{ .success = true, .output = try buf.toOwnedSlice() };
+        return root.ToolResult{ .success = true, .output = try buf.toOwnedSlice(allocator) };
     }
 
     fn updateContact(allocator: std.mem.Allocator, db: *c.sqlite3, id: []const u8, name: []const u8, company_id: ?[]const u8, role: ?[]const u8, email: ?[]const u8, phone: ?[]const u8, notes: ?[]const u8) !root.ToolResult {
@@ -171,9 +171,9 @@ pub const SaveContactTool = struct {
         if (rc != c.SQLITE_DONE) return root.ToolResult.fail("Failed to update contact");
 
         // Build fields_updated list
-        var fields_buf = std.ArrayList(u8).init(allocator);
-        defer fields_buf.deinit();
-        const fw = fields_buf.writer();
+        var fields_buf: std.ArrayList(u8) = .empty;
+        defer fields_buf.deinit(allocator);
+        const fw = fields_buf.writer(allocator);
         var first = true;
         const field_names = [_]struct { name: []const u8, val: ?[]const u8 }{
             .{ .name = "company_id", .val = company_id },
@@ -239,9 +239,9 @@ pub const SaveContactTool = struct {
         rc = c.sqlite3_step(stmt.?);
         if (rc != c.SQLITE_ROW) return root.ToolResult.fail("Contact not found after save");
 
-        var buf = std.ArrayList(u8).init(allocator);
-        errdefer buf.deinit();
-        const w = buf.writer();
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(allocator);
+        const w = buf.writer(allocator);
 
         try w.writeAll("{\"status\":\"");
         try w.writeAll(status);
@@ -267,7 +267,7 @@ pub const SaveContactTool = struct {
         }
 
         try w.writeByte('}');
-        return root.ToolResult{ .success = true, .output = try buf.toOwnedSlice() };
+        return root.ToolResult{ .success = true, .output = try buf.toOwnedSlice(allocator) };
     }
 };
 

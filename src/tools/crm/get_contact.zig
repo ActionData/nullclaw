@@ -82,12 +82,12 @@ pub const GetContactTool = struct {
         if (rc != c.SQLITE_OK) return root.ToolResult.fail("Failed to prepare contact query");
         defer _ = c.sqlite3_finalize(stmt);
 
-        const like_name = try std.fmt.allocPrintZ(allocator, "%{s}%", .{name});
+        const like_name = try std.fmt.allocPrint(allocator, "%{s}%", .{name});
         defer allocator.free(like_name);
-        _ = c.sqlite3_bind_text(stmt, 1, like_name.ptr, @intCast(like_name.len - 1), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 1, like_name.ptr, @intCast(like_name.len), SQLITE_STATIC);
 
         // Collect all matches
-        var matches = std.ArrayList(ContactMatch).init(allocator);
+        var matches: std.ArrayList(ContactMatch) = .empty;
         defer {
             for (matches.items) |m| {
                 allocator.free(m.id);
@@ -95,7 +95,7 @@ pub const GetContactTool = struct {
                 allocator.free(m.company);
                 allocator.free(m.role);
             }
-            matches.deinit();
+            matches.deinit(allocator);
         }
 
         while (c.sqlite3_step(stmt.?) == c.SQLITE_ROW) {
@@ -114,8 +114,8 @@ pub const GetContactTool = struct {
 
         if (matches.items.len > 1) {
             // Disambiguation
-            var result = std.ArrayList(u8).init(allocator);
-            errdefer result.deinit();
+            var result: std.ArrayList(u8) = .empty;
+            errdefer result.deinit(allocator);
 
             const header = try std.fmt.allocPrint(allocator,
                 \\{{"status":"disambiguation_needed","message":"Multiple contacts match '{s}'. Which one did you mean?","candidates":[
@@ -172,8 +172,8 @@ pub const GetContactTool = struct {
         const co_industry = columnText(stmt, 10);
         const co_size = columnText(stmt, 11);
 
-        var result = std.ArrayList(u8).init(allocator);
-        errdefer result.deinit();
+        var result: std.ArrayList(u8) = .empty;
+        errdefer result.deinit(allocator);
 
         const contact_json = try std.fmt.allocPrint(allocator,
             \\{{"contact":{{"id":"{s}","name":"{s}","role":"{s}","email":"{s}","phone":"{s}","notes":"{s}","created_at":"{s}","updated_at":"{s}"}},"company":{{"id":"{s}","name":"{s}","industry":"{s}","size":"{s}"}},"recent_activities":[

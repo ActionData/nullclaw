@@ -42,8 +42,8 @@ pub const SearchCrmTool = struct {
             else => false,
         } else false;
 
-        var results = std.ArrayList(u8).init(allocator);
-        errdefer results.deinit();
+        var results: std.ArrayList(u8) = .empty;
+        errdefer results.deinit(allocator);
 
         try results.appendSlice(allocator, "{\"results\":[");
 
@@ -115,8 +115,8 @@ pub const SearchCrmTool = struct {
 
     fn searchDeals(db: *c.sqlite3, allocator: std.mem.Allocator, results: *std.ArrayList(u8), query: []const u8, stage: ?[]const u8, min_value: ?f64, company: ?[]const u8, limit: i64) !usize {
         // Build SQL dynamically based on filters
-        var sql_buf = std.ArrayList(u8).init(allocator);
-        defer sql_buf.deinit();
+        var sql_buf: std.ArrayList(u8) = .empty;
+        defer sql_buf.deinit(allocator);
 
         try sql_buf.appendSlice(allocator,
             \\SELECT d.id, d.title, d.stage, d.value, d.currency, co.name as company_name
@@ -138,9 +138,9 @@ pub const SearchCrmTool = struct {
         defer _ = c.sqlite3_finalize(stmt);
 
         // Bind query as LIKE pattern
-        const like_query = try std.fmt.allocPrintZ(allocator, "%{s}%", .{query});
+        const like_query = try std.fmt.allocPrint(allocator, "%{s}%", .{query});
         defer allocator.free(like_query);
-        _ = c.sqlite3_bind_text(stmt, 1, like_query.ptr, @intCast(like_query.len - 1), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 1, like_query.ptr, @intCast(like_query.len), SQLITE_STATIC);
 
         if (stage) |s| {
             _ = c.sqlite3_bind_text(stmt, 2, s.ptr, @intCast(s.len), SQLITE_STATIC);
@@ -149,9 +149,9 @@ pub const SearchCrmTool = struct {
             _ = c.sqlite3_bind_double(stmt, 3, mv);
         }
         if (company) |comp| {
-            const like_comp = try std.fmt.allocPrintZ(allocator, "%{s}%", .{comp});
+            const like_comp = try std.fmt.allocPrint(allocator, "%{s}%", .{comp});
             defer allocator.free(like_comp);
-            _ = c.sqlite3_bind_text(stmt, 4, like_comp.ptr, @intCast(like_comp.len - 1), SQLITE_STATIC);
+            _ = c.sqlite3_bind_text(stmt, 4, like_comp.ptr, @intCast(like_comp.len), SQLITE_STATIC);
         }
         _ = c.sqlite3_bind_int64(stmt, 5, limit);
 
@@ -176,8 +176,8 @@ pub const SearchCrmTool = struct {
     }
 
     fn searchContacts(db: *c.sqlite3, allocator: std.mem.Allocator, results: *std.ArrayList(u8), query: []const u8, company: ?[]const u8, limit: i64) !usize {
-        var sql_buf = std.ArrayList(u8).init(allocator);
-        defer sql_buf.deinit();
+        var sql_buf: std.ArrayList(u8) = .empty;
+        defer sql_buf.deinit(allocator);
 
         try sql_buf.appendSlice(allocator,
             \\SELECT ct.id, ct.name, ct.role, co.name as company_name
@@ -196,14 +196,14 @@ pub const SearchCrmTool = struct {
         if (rc != c.SQLITE_OK) return 0;
         defer _ = c.sqlite3_finalize(stmt);
 
-        const like_query = try std.fmt.allocPrintZ(allocator, "%{s}%", .{query});
+        const like_query = try std.fmt.allocPrint(allocator, "%{s}%", .{query});
         defer allocator.free(like_query);
-        _ = c.sqlite3_bind_text(stmt, 1, like_query.ptr, @intCast(like_query.len - 1), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 1, like_query.ptr, @intCast(like_query.len), SQLITE_STATIC);
 
         if (company) |comp| {
-            const like_comp = try std.fmt.allocPrintZ(allocator, "%{s}%", .{comp});
+            const like_comp = try std.fmt.allocPrint(allocator, "%{s}%", .{comp});
             defer allocator.free(like_comp);
-            _ = c.sqlite3_bind_text(stmt, 2, like_comp.ptr, @intCast(like_comp.len - 1), SQLITE_STATIC);
+            _ = c.sqlite3_bind_text(stmt, 2, like_comp.ptr, @intCast(like_comp.len), SQLITE_STATIC);
         }
         _ = c.sqlite3_bind_int64(stmt, 3, limit);
 
@@ -240,9 +240,9 @@ pub const SearchCrmTool = struct {
         if (rc != c.SQLITE_OK) return 0;
         defer _ = c.sqlite3_finalize(stmt);
 
-        const like_query = try std.fmt.allocPrintZ(allocator, "%{s}%", .{query});
+        const like_query = try std.fmt.allocPrint(allocator, "%{s}%", .{query});
         defer allocator.free(like_query);
-        _ = c.sqlite3_bind_text(stmt, 1, like_query.ptr, @intCast(like_query.len - 1), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 1, like_query.ptr, @intCast(like_query.len), SQLITE_STATIC);
         _ = c.sqlite3_bind_int64(stmt, 2, limit);
 
         var count: usize = 0;
@@ -266,8 +266,8 @@ pub const SearchCrmTool = struct {
     }
 
     fn searchActivities(db: *c.sqlite3, allocator: std.mem.Allocator, results: *std.ArrayList(u8), query: []const u8, company: ?[]const u8, limit: i64) !usize {
-        var sql_buf = std.ArrayList(u8).init(allocator);
-        defer sql_buf.deinit();
+        var sql_buf: std.ArrayList(u8) = .empty;
+        defer sql_buf.deinit(allocator);
 
         try sql_buf.appendSlice(allocator,
             \\SELECT a.id, a.type, a.summary, a.date, co.name as company_name
@@ -286,14 +286,14 @@ pub const SearchCrmTool = struct {
         if (rc != c.SQLITE_OK) return 0;
         defer _ = c.sqlite3_finalize(stmt);
 
-        const like_query = try std.fmt.allocPrintZ(allocator, "%{s}%", .{query});
+        const like_query = try std.fmt.allocPrint(allocator, "%{s}%", .{query});
         defer allocator.free(like_query);
-        _ = c.sqlite3_bind_text(stmt, 1, like_query.ptr, @intCast(like_query.len - 1), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 1, like_query.ptr, @intCast(like_query.len), SQLITE_STATIC);
 
         if (company) |comp| {
-            const like_comp = try std.fmt.allocPrintZ(allocator, "%{s}%", .{comp});
+            const like_comp = try std.fmt.allocPrint(allocator, "%{s}%", .{comp});
             defer allocator.free(like_comp);
-            _ = c.sqlite3_bind_text(stmt, 2, like_comp.ptr, @intCast(like_comp.len - 1), SQLITE_STATIC);
+            _ = c.sqlite3_bind_text(stmt, 2, like_comp.ptr, @intCast(like_comp.len), SQLITE_STATIC);
         }
         _ = c.sqlite3_bind_int64(stmt, 3, limit);
 

@@ -99,9 +99,9 @@ pub const UpdateDealStageTool = struct {
             if (rc != c.SQLITE_OK) return root.ToolResult.fail("Failed to prepare query");
             defer _ = c.sqlite3_finalize(stmt);
 
-            const like_title = try std.fmt.allocPrintZ(allocator, "%{s}%", .{deal_title.?});
+            const like_title = try std.fmt.allocPrint(allocator, "%{s}%", .{deal_title.?});
             defer allocator.free(like_title);
-            _ = c.sqlite3_bind_text(stmt, 1, like_title.ptr, @intCast(like_title.len - 1), SQLITE_STATIC);
+            _ = c.sqlite3_bind_text(stmt, 1, like_title.ptr, @intCast(like_title.len), SQLITE_STATIC);
 
             rc = c.sqlite3_step(stmt.?);
             if (rc != c.SQLITE_ROW) {

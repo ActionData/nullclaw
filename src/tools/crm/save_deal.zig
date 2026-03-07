@@ -144,10 +144,10 @@ pub const SaveDealTool = struct {
 
         _ = c.sqlite3_bind_text(stmt, 1, title.ptr, @intCast(title.len), schema.SQLITE_STATIC);
 
-        var list = std.ArrayList(DealCandidate).init(allocator);
+        var list: std.ArrayList(DealCandidate) = .empty;
         errdefer {
             for (list.items) |item| allocator.free(item.id);
-            list.deinit();
+            list.deinit(allocator);
         }
 
         while (c.sqlite3_step(stmt.?) == c.SQLITE_ROW) {
@@ -155,20 +155,20 @@ pub const SaveDealTool = struct {
             if (id_raw == null) continue;
             const id_copy = try allocator.dupe(u8, std.mem.span(id_raw));
 
-            try list.append(.{
+            try list.append(allocator, .{
                 .id = id_copy,
                 .title = c.sqlite3_column_text(stmt.?, 1),
                 .stage = c.sqlite3_column_text(stmt.?, 2),
                 .company_id = c.sqlite3_column_text(stmt.?, 3),
             });
         }
-        return list.toOwnedSlice();
+        return list.toOwnedSlice(allocator);
     }
 
     fn buildDisambiguationResponse(allocator: std.mem.Allocator, title: []const u8, candidates: []const DealCandidate) !root.ToolResult {
-        var buf = std.ArrayList(u8).init(allocator);
-        errdefer buf.deinit();
-        const w = buf.writer();
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(allocator);
+        const w = buf.writer(allocator);
 
         try w.writeAll("{\"status\":\"disambiguation_needed\",\"message\":\"Multiple deals match '");
         try helpers.writeJsonEscaped(w, title);
@@ -187,7 +187,7 @@ pub const SaveDealTool = struct {
             try w.writeByte('}');
         }
         try w.writeAll("]}");
-        return root.ToolResult{ .success = true, .output = try buf.toOwnedSlice() };
+        return root.ToolResult{ .success = true, .output = try buf.toOwnedSlice(allocator) };
     }
 
     fn updateDeal(allocator: std.mem.Allocator, db_inst: *CrmDb, db: *c.sqlite3, existing: DealCandidate, title: []const u8, company_id: ?[]const u8, contact_id: ?[]const u8, stage: []const u8, value: ?f64, currency: ?[]const u8, close_date: ?[]const u8, next_step: ?[]const u8, notes: ?[]const u8) !root.ToolResult {
@@ -322,9 +322,9 @@ pub const SaveDealTool = struct {
         rc = c.sqlite3_step(stmt.?);
         if (rc != c.SQLITE_ROW) return root.ToolResult.fail("Deal not found after save");
 
-        var buf = std.ArrayList(u8).init(allocator);
-        errdefer buf.deinit();
-        const w = buf.writer();
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(allocator);
+        const w = buf.writer(allocator);
 
         try w.writeAll("{\"status\":\"");
         try w.writeAll(status);
@@ -360,7 +360,7 @@ pub const SaveDealTool = struct {
         }
 
         try w.writeByte('}');
-        return root.ToolResult{ .success = true, .output = try buf.toOwnedSlice() };
+        return root.ToolResult{ .success = true, .output = try buf.toOwnedSlice(allocator) };
     }
 
     fn appendLatestStageHistory(w: anytype, db: *c.sqlite3, deal_id: []const u8) !void {
