@@ -6,6 +6,7 @@ const schema = @import("schema.zig");
 const CrmDb = schema.CrmDb;
 const c = schema.c;
 const SQLITE_STATIC = schema.SQLITE_STATIC;
+const helpers = @import("save_company.zig");
 
 pub const SearchCrmTool = struct {
     db: ?*CrmDb = null,
@@ -97,9 +98,12 @@ pub const SearchCrmTool = struct {
         }
 
         const search_path: []const u8 = if (has_filters) "structured" else "semantic";
-        const tail = try std.fmt.allocPrint(allocator, "],\"total\":{d},\"search_path\":\"{s}\"}}", .{ count, search_path });
-        defer allocator.free(tail);
-        try results.appendSlice(allocator, tail);
+        const w = results.writer(allocator);
+        try w.writeAll("],\"total\":");
+        try std.fmt.format(w, "{d}", .{count});
+        try w.writeAll(",\"search_path\":\"");
+        try w.writeAll(search_path);
+        try w.writeAll("\"}");
 
         return root.ToolResult{ .success = true, .output = try results.toOwnedSlice(allocator) };
     }
@@ -165,11 +169,23 @@ pub const SearchCrmTool = struct {
             const value = c.sqlite3_column_double(stmt.?, 3);
             const company_name = columnText(stmt.?, 5);
 
-            const entry = try std.fmt.allocPrint(allocator,
-                \\{{"type":"deal","id":"{s}","title":"{s}","summary":"Deal with {s}, {s} stage, ${d:.0}","stage":"{s}","value":{d:.2},"company":"{s}"}}
-            , .{ id, title, company_name, deal_stage, value, deal_stage, value, company_name });
-            defer allocator.free(entry);
-            try results.appendSlice(allocator, entry);
+            const w = results.writer(allocator);
+            try w.writeAll("{\"type\":\"deal\",\"id\":\"");
+            try helpers.writeJsonEscaped(w, id);
+            try w.writeAll("\",\"title\":\"");
+            try helpers.writeJsonEscaped(w, title);
+            try w.writeAll("\",\"summary\":\"Deal with ");
+            try helpers.writeJsonEscaped(w, company_name);
+            try w.writeAll(", ");
+            try helpers.writeJsonEscaped(w, deal_stage);
+            try std.fmt.format(w, " stage, ${d:.0}", .{value});
+            try w.writeAll("\",\"stage\":\"");
+            try helpers.writeJsonEscaped(w, deal_stage);
+            try w.writeAll("\",\"value\":");
+            try std.fmt.format(w, "{d:.2}", .{value});
+            try w.writeAll(",\"company\":\"");
+            try helpers.writeJsonEscaped(w, company_name);
+            try w.writeAll("\"}");
             count += 1;
         }
         return count;
@@ -217,11 +233,18 @@ pub const SearchCrmTool = struct {
             const role = columnText(stmt.?, 2);
             const company_name = columnText(stmt.?, 3);
 
-            const entry = try std.fmt.allocPrint(allocator,
-                \\{{"type":"contact","id":"{s}","name":"{s}","summary":"{s} at {s}","company":"{s}"}}
-            , .{ id, name, role, company_name, company_name });
-            defer allocator.free(entry);
-            try results.appendSlice(allocator, entry);
+            const w = results.writer(allocator);
+            try w.writeAll("{\"type\":\"contact\",\"id\":\"");
+            try helpers.writeJsonEscaped(w, id);
+            try w.writeAll("\",\"name\":\"");
+            try helpers.writeJsonEscaped(w, name);
+            try w.writeAll("\",\"summary\":\"");
+            try helpers.writeJsonEscaped(w, role);
+            try w.writeAll(" at ");
+            try helpers.writeJsonEscaped(w, company_name);
+            try w.writeAll("\",\"company\":\"");
+            try helpers.writeJsonEscaped(w, company_name);
+            try w.writeAll("\"}");
             count += 1;
         }
         return count;
@@ -255,11 +278,20 @@ pub const SearchCrmTool = struct {
             const industry = columnText(stmt.?, 2);
             const size = columnText(stmt.?, 3);
 
-            const entry = try std.fmt.allocPrint(allocator,
-                \\{{"type":"company","id":"{s}","name":"{s}","summary":"{s}, {s}","industry":"{s}","size":"{s}"}}
-            , .{ id, name, industry, size, industry, size });
-            defer allocator.free(entry);
-            try results.appendSlice(allocator, entry);
+            const w = results.writer(allocator);
+            try w.writeAll("{\"type\":\"company\",\"id\":\"");
+            try helpers.writeJsonEscaped(w, id);
+            try w.writeAll("\",\"name\":\"");
+            try helpers.writeJsonEscaped(w, name);
+            try w.writeAll("\",\"summary\":\"");
+            try helpers.writeJsonEscaped(w, industry);
+            try w.writeAll(", ");
+            try helpers.writeJsonEscaped(w, size);
+            try w.writeAll("\",\"industry\":\"");
+            try helpers.writeJsonEscaped(w, industry);
+            try w.writeAll("\",\"size\":\"");
+            try helpers.writeJsonEscaped(w, size);
+            try w.writeAll("\"}");
             count += 1;
         }
         return count;
@@ -308,11 +340,18 @@ pub const SearchCrmTool = struct {
             const date = columnText(stmt.?, 3);
             const company_name = columnText(stmt.?, 4);
 
-            const entry = try std.fmt.allocPrint(allocator,
-                \\{{"type":"activity","id":"{s}","activity_type":"{s}","summary":"{s}","date":"{s}","company":"{s}"}}
-            , .{ id, atype, summary, date, company_name });
-            defer allocator.free(entry);
-            try results.appendSlice(allocator, entry);
+            const w = results.writer(allocator);
+            try w.writeAll("{\"type\":\"activity\",\"id\":\"");
+            try helpers.writeJsonEscaped(w, id);
+            try w.writeAll("\",\"activity_type\":\"");
+            try helpers.writeJsonEscaped(w, atype);
+            try w.writeAll("\",\"summary\":\"");
+            try helpers.writeJsonEscaped(w, summary);
+            try w.writeAll("\",\"date\":\"");
+            try helpers.writeJsonEscaped(w, date);
+            try w.writeAll("\",\"company\":\"");
+            try helpers.writeJsonEscaped(w, company_name);
+            try w.writeAll("\"}");
             count += 1;
         }
         return count;

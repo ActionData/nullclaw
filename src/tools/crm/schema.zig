@@ -75,6 +75,7 @@ pub const CrmDb = struct {
     pub fn ensureSchema(self: *Self) !void {
         try self.execSql(schema_ddl);
         try self.execSql(index_ddl);
+        try self.execSql(version_ddl);
     }
 
     /// Executes a SQL string that may contain multiple statements.
@@ -191,6 +192,23 @@ pub const CrmDb = struct {
         \\CREATE INDEX IF NOT EXISTS idx_activities_date ON activities(date);
         \\CREATE INDEX IF NOT EXISTS idx_activities_followup ON activities(follow_up_date);
         \\CREATE INDEX IF NOT EXISTS idx_stage_history_deal ON stage_history(deal_id);
+        \\CREATE INDEX IF NOT EXISTS idx_companies_name ON companies(name COLLATE NOCASE);
+        \\CREATE INDEX IF NOT EXISTS idx_contacts_email ON contacts(email);
+        \\CREATE INDEX IF NOT EXISTS idx_deals_value ON deals(value);
+        \\CREATE INDEX IF NOT EXISTS idx_deals_title ON deals(title COLLATE NOCASE);
+        \\CREATE INDEX IF NOT EXISTS idx_activities_company_id ON activities(company_id);
+        \\CREATE INDEX IF NOT EXISTS idx_activities_rep_id ON activities(rep_id);
+        \\CREATE INDEX IF NOT EXISTS idx_activities_type ON activities(type);
+        \\CREATE INDEX IF NOT EXISTS idx_stage_history_changed_at ON stage_history(changed_at);
+    ;
+
+    const version_ddl: [:0]const u8 =
+        \\CREATE TABLE IF NOT EXISTS schema_version (
+        \\    version INTEGER NOT NULL,
+        \\    applied_at TEXT NOT NULL DEFAULT (datetime('now')),
+        \\    description TEXT
+        \\);
+        \\INSERT INTO schema_version (version, description) SELECT 1, 'Initial CRM schema' WHERE NOT EXISTS (SELECT 1 FROM schema_version);
     ;
 };
 
@@ -211,6 +229,7 @@ test "crm schema creates all tables" {
         "deals",
         "activities",
         "stage_history",
+        "schema_version",
     };
 
     for (expected_tables) |table_name| {
@@ -244,6 +263,14 @@ test "crm schema creates all indexes" {
         "idx_activities_date",
         "idx_activities_followup",
         "idx_stage_history_deal",
+        "idx_companies_name",
+        "idx_contacts_email",
+        "idx_deals_value",
+        "idx_deals_title",
+        "idx_activities_company_id",
+        "idx_activities_rep_id",
+        "idx_activities_type",
+        "idx_stage_history_changed_at",
     };
 
     for (expected_indexes) |index_name| {
@@ -270,7 +297,7 @@ test "crm schema ensureSchema is idempotent" {
     try db.ensureSchema();
 
     // Verify tables still exist
-    const sql = "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('companies','contacts','deals','activities','stage_history');";
+    const sql = "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('companies','contacts','deals','activities','stage_history','schema_version');";
     var stmt: ?*c.sqlite3_stmt = null;
     var rc = c.sqlite3_prepare_v2(db.db, sql, -1, &stmt, null);
     try std.testing.expectEqual(@as(c_int, c.SQLITE_OK), rc);
@@ -280,7 +307,7 @@ test "crm schema ensureSchema is idempotent" {
     try std.testing.expectEqual(@as(c_int, c.SQLITE_ROW), rc);
 
     const count = c.sqlite3_column_int(stmt.?, 0);
-    try std.testing.expectEqual(@as(c_int, 5), count);
+    try std.testing.expectEqual(@as(c_int, 6), count);
 }
 
 test "crm schema foreign keys enforced" {

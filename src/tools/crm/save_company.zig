@@ -5,6 +5,7 @@ const root = @import("../root.zig");
 const schema = @import("schema.zig");
 const CrmDb = schema.CrmDb;
 const c = schema.c;
+const resolve = @import("resolve.zig");
 
 pub const SaveCompanyTool = struct {
     db: ?*CrmDb = null,
@@ -33,86 +34,29 @@ pub const SaveCompanyTool = struct {
         const website = root.getString(args, "website");
         const notes = root.getString(args, "notes");
 
-        // Search for existing companies by name (case-insensitive)
-        const candidates = try searchByName(allocator, db, name);
-        defer {
-            for (candidates) |cand| allocator.free(cand.id);
-            allocator.free(candidates);
+        // Resolve existing company by name using tiered matching
+        var result = try resolve.resolveCompany(db_inst, allocator, name, null);
+        defer resolve.freeResult(allocator, &result);
+
+        switch (result) {
+            .ambiguous => |candidates| {
+                const msg = try resolve.formatCandidates(allocator, candidates, "company");
+                defer allocator.free(msg);
+                var buf: std.ArrayList(u8) = .empty;
+                errdefer buf.deinit(allocator);
+                const w = buf.writer(allocator);
+                try w.writeAll("{\"status\":\"disambiguation_needed\",\"message\":\"");
+                try writeJsonEscaped(w, msg);
+                try w.writeAll("\"}");
+                return root.ToolResult{ .success = true, .output = try buf.toOwnedSlice(allocator) };
+            },
+            .resolved => |r| {
+                return updateCompany(allocator, db, r.id, name, industry, size, website, notes);
+            },
+            .not_found => {
+                return createCompany(allocator, db_inst, db, name, industry, size, website, notes);
+            },
         }
-
-        if (candidates.len > 1) {
-            return buildDisambiguationResponse(allocator, name, candidates);
-        }
-
-        if (candidates.len == 1) {
-            return updateCompany(allocator, db, candidates[0].id, name, industry, size, website, notes);
-        }
-
-        // No match — create new
-        return createCompany(allocator, db_inst, db, name, industry, size, website, notes);
-    }
-
-    const Candidate = struct {
-        id: []const u8,
-        name: [*c]const u8,
-        industry: [*c]const u8,
-        size: [*c]const u8,
-    };
-
-    fn searchByName(allocator: std.mem.Allocator, db: *c.sqlite3, name: []const u8) ![]Candidate {
-        const sql = "SELECT id, name, industry, size FROM companies WHERE name = ?1 COLLATE NOCASE;";
-        var stmt: ?*c.sqlite3_stmt = null;
-        const rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
-        if (rc != c.SQLITE_OK) return error.SqlitePrepareFailed;
-        defer _ = c.sqlite3_finalize(stmt);
-
-        _ = c.sqlite3_bind_text(stmt, 1, name.ptr, @intCast(name.len), schema.SQLITE_STATIC);
-
-        var list: std.ArrayList(Candidate) = .empty;
-        errdefer {
-            for (list.items) |item| allocator.free(item.id);
-            list.deinit(allocator);
-        }
-
-        while (c.sqlite3_step(stmt.?) == c.SQLITE_ROW) {
-            const id_raw = c.sqlite3_column_text(stmt.?, 0);
-            if (id_raw == null) continue;
-            const id_slice = std.mem.span(id_raw);
-            const id_copy = try allocator.dupe(u8, id_slice);
-
-            try list.append(allocator, .{
-                .id = id_copy,
-                .name = c.sqlite3_column_text(stmt.?, 1),
-                .industry = c.sqlite3_column_text(stmt.?, 2),
-                .size = c.sqlite3_column_text(stmt.?, 3),
-            });
-        }
-        return list.toOwnedSlice(allocator);
-    }
-
-    fn buildDisambiguationResponse(allocator: std.mem.Allocator, name: []const u8, candidates: []const Candidate) !root.ToolResult {
-        var buf: std.ArrayList(u8) = .empty;
-        errdefer buf.deinit(allocator);
-        const w = buf.writer(allocator);
-
-        try w.writeAll("{\"status\":\"disambiguation_needed\",\"message\":\"Multiple companies match '");
-        try writeJsonEscaped(w, name);
-        try w.writeAll("'. Please confirm which one, or indicate this is a new company.\",\"candidates\":[");
-
-        for (candidates, 0..) |cand, i| {
-            if (i > 0) try w.writeByte(',');
-            try w.writeAll("{\"id\":\"");
-            try w.writeAll(cand.id);
-            try w.writeAll("\",\"name\":\"");
-            try writeJsonEscapedC(w, cand.name);
-            try w.writeAll("\",\"industry\":");
-            try writeNullableJsonC(w, cand.industry);
-            try w.writeAll(",\"size\":");
-            try writeNullableJsonC(w, cand.size);
-            try w.writeByte('}');
-        }
-        try w.writeAll("]}");
-        return root.ToolResult{ .success = true, .output = try buf.toOwnedSlice(allocator) };
     }
 
     fn updateCompany(allocator: std.mem.Allocator, db: *c.sqlite3, id: []const u8, name: []const u8, industry: ?[]const u8, size: ?[]const u8, website: ?[]const u8, notes: ?[]const u8) !root.ToolResult {
@@ -379,8 +323,8 @@ test "save_company duplicate detection" {
     defer std.testing.allocator.free(result.output);
     try std.testing.expect(result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "disambiguation_needed") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "c1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "c2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "Acme Corp") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "Which one did you mean?") != null);
 }
 
 test "save_company update existing" {

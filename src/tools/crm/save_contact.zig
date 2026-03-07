@@ -6,6 +6,7 @@ const schema = @import("schema.zig");
 const CrmDb = schema.CrmDb;
 const c = schema.c;
 const helpers = @import("save_company.zig");
+const resolve = @import("resolve.zig");
 
 pub const SaveContactTool = struct {
     db: ?*CrmDb = null,
@@ -29,12 +30,28 @@ pub const SaveContactTool = struct {
         const name = root.getString(args, "name") orelse return root.ToolResult.fail("Missing required parameter: name");
         if (name.len == 0) return root.ToolResult.fail("'name' must not be empty");
 
-        // Resolve company: company_id takes precedence, else search by name
+        // Resolve company: company_id takes precedence, else resolve by name
         var resolved_company_id: ?[]const u8 = root.getString(args, "company_id");
         const company_name = root.getString(args, "company");
 
         if (resolved_company_id == null and company_name != null) {
-            resolved_company_id = try resolveCompanyByName(allocator, db, company_name.?);
+            var company_result = try resolve.resolveCompany(db_inst, allocator, company_name.?, null);
+            defer resolve.freeResult(allocator, &company_result);
+            switch (company_result) {
+                .resolved => |r| resolved_company_id = r.id,
+                .ambiguous => |candidates| {
+                    const msg = try resolve.formatCandidates(allocator, candidates, "company");
+                    defer allocator.free(msg);
+                    var buf: std.ArrayList(u8) = .empty;
+                    errdefer buf.deinit(allocator);
+                    const w = buf.writer(allocator);
+                    try w.writeAll("{\"status\":\"disambiguation_needed\",\"message\":\"");
+                    try helpers.writeJsonEscaped(w, msg);
+                    try w.writeAll("\"}");
+                    return root.ToolResult{ .success = true, .output = try buf.toOwnedSlice(allocator) };
+                },
+                .not_found => {},
+            }
         }
 
         const role = root.getString(args, "role");
@@ -42,101 +59,29 @@ pub const SaveContactTool = struct {
         const phone = root.getString(args, "phone");
         const notes = root.getString(args, "notes");
 
-        // Search for existing contacts by name (case-insensitive)
-        const candidates = try searchByName(allocator, db, name);
-        defer {
-            for (candidates) |cand| allocator.free(cand.id);
-            allocator.free(candidates);
+        // Resolve existing contact by name using tiered matching
+        var contact_result = try resolve.resolveContact(db_inst, allocator, name, null, resolved_company_id);
+        defer resolve.freeResult(allocator, &contact_result);
+
+        switch (contact_result) {
+            .ambiguous => |candidates| {
+                const msg = try resolve.formatCandidates(allocator, candidates, "contact");
+                defer allocator.free(msg);
+                var buf: std.ArrayList(u8) = .empty;
+                errdefer buf.deinit(allocator);
+                const w = buf.writer(allocator);
+                try w.writeAll("{\"status\":\"disambiguation_needed\",\"message\":\"");
+                try helpers.writeJsonEscaped(w, msg);
+                try w.writeAll("\"}");
+                return root.ToolResult{ .success = true, .output = try buf.toOwnedSlice(allocator) };
+            },
+            .resolved => |r| {
+                return updateContact(allocator, db, r.id, name, resolved_company_id, role, email, phone, notes);
+            },
+            .not_found => {
+                return createContact(allocator, db_inst, db, name, resolved_company_id, role, email, phone, notes);
+            },
         }
-
-        if (candidates.len > 1) {
-            return buildDisambiguationResponse(allocator, name, candidates);
-        }
-
-        if (candidates.len == 1) {
-            return updateContact(allocator, db, candidates[0].id, name, resolved_company_id, role, email, phone, notes);
-        }
-
-        return createContact(allocator, db_inst, db, name, resolved_company_id, role, email, phone, notes);
-    }
-
-    fn resolveCompanyByName(allocator: std.mem.Allocator, db: *c.sqlite3, name: []const u8) !?[]const u8 {
-        _ = allocator;
-        const sql = "SELECT id FROM companies WHERE name = ?1 COLLATE NOCASE LIMIT 1;";
-        var stmt: ?*c.sqlite3_stmt = null;
-        var rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
-        if (rc != c.SQLITE_OK) return null;
-        defer _ = c.sqlite3_finalize(stmt);
-
-        _ = c.sqlite3_bind_text(stmt, 1, name.ptr, @intCast(name.len), schema.SQLITE_STATIC);
-        rc = c.sqlite3_step(stmt.?);
-        if (rc != c.SQLITE_ROW) return null;
-
-        const raw = c.sqlite3_column_text(stmt.?, 0);
-        if (raw == null) return null;
-        return std.mem.span(raw);
-    }
-
-    const Candidate = struct {
-        id: []const u8,
-        name: [*c]const u8,
-        company_id: [*c]const u8,
-        role: [*c]const u8,
-    };
-
-    fn searchByName(allocator: std.mem.Allocator, db: *c.sqlite3, name: []const u8) ![]Candidate {
-        const sql = "SELECT id, name, company_id, role FROM contacts WHERE name = ?1 COLLATE NOCASE;";
-        var stmt: ?*c.sqlite3_stmt = null;
-        const rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
-        if (rc != c.SQLITE_OK) return error.SqlitePrepareFailed;
-        defer _ = c.sqlite3_finalize(stmt);
-
-        _ = c.sqlite3_bind_text(stmt, 1, name.ptr, @intCast(name.len), schema.SQLITE_STATIC);
-
-        var list: std.ArrayList(Candidate) = .empty;
-        errdefer {
-            for (list.items) |item| allocator.free(item.id);
-            list.deinit(allocator);
-        }
-
-        while (c.sqlite3_step(stmt.?) == c.SQLITE_ROW) {
-            const id_raw = c.sqlite3_column_text(stmt.?, 0);
-            if (id_raw == null) continue;
-            const id_copy = try allocator.dupe(u8, std.mem.span(id_raw));
-
-            try list.append(allocator, .{
-                .id = id_copy,
-                .name = c.sqlite3_column_text(stmt.?, 1),
-                .company_id = c.sqlite3_column_text(stmt.?, 2),
-                .role = c.sqlite3_column_text(stmt.?, 3),
-            });
-        }
-        return list.toOwnedSlice(allocator);
-    }
-
-    fn buildDisambiguationResponse(allocator: std.mem.Allocator, name: []const u8, candidates: []const Candidate) !root.ToolResult {
-        var buf: std.ArrayList(u8) = .empty;
-        errdefer buf.deinit(allocator);
-        const w = buf.writer(allocator);
-
-        try w.writeAll("{\"status\":\"disambiguation_needed\",\"message\":\"Multiple contacts match '");
-        try helpers.writeJsonEscaped(w, name);
-        try w.writeAll("'. Please confirm which one, or indicate this is a new contact.\",\"candidates\":[");
-
-        for (candidates, 0..) |cand, i| {
-            if (i > 0) try w.writeByte(',');
-            try w.writeAll("{\"id\":\"");
-            try w.writeAll(cand.id);
-            try w.writeAll("\",\"name\":");
-            try helpers.writeNullableJsonC(w, cand.name);
-            try w.writeAll(",\"company_id\":");
-            try helpers.writeNullableJsonC(w, cand.company_id);
-            try w.writeAll(",\"role\":");
-            try helpers.writeNullableJsonC(w, cand.role);
-            try w.writeByte('}');
-        }
-        try w.writeAll("]}");
-        return root.ToolResult{ .success = true, .output = try buf.toOwnedSlice(allocator) };
     }
 
     fn updateContact(allocator: std.mem.Allocator, db: *c.sqlite3, id: []const u8, name: []const u8, company_id: ?[]const u8, role: ?[]const u8, email: ?[]const u8, phone: ?[]const u8, notes: ?[]const u8) !root.ToolResult {
@@ -317,6 +262,7 @@ test "save_contact duplicate detection" {
     defer std.testing.allocator.free(result.output);
     try std.testing.expect(result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "disambiguation_needed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "Which one did you mean?") != null);
 }
 
 test "save_contact update existing" {

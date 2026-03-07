@@ -6,6 +6,8 @@ const schema = @import("schema.zig");
 const CrmDb = schema.CrmDb;
 const c = schema.c;
 const SQLITE_STATIC = schema.SQLITE_STATIC;
+const resolve = @import("resolve.zig");
+const helpers = @import("save_company.zig");
 
 pub const GetContactTool = struct {
     db: ?*CrmDb = null,
@@ -35,12 +37,39 @@ pub const GetContactTool = struct {
         const db = crm_db.db orelse
             return root.ToolResult.fail("CRM database not open");
 
-        if (id) |contact_id| {
-            return self.lookupById(allocator, db, contact_id);
-        }
+        // Use resolve module for both ID and name lookups
+        var result = try resolve.resolveContact(crm_db, allocator, name, id, null);
+        defer resolve.freeResult(allocator, &result);
 
-        // Name-based lookup
-        return self.lookupByName(allocator, db, name.?);
+        switch (result) {
+            .resolved => |r| {
+                return self.lookupById(allocator, db, r.id);
+            },
+            .ambiguous => |candidates| {
+                const msg = try resolve.formatCandidates(allocator, candidates, "contact");
+                defer allocator.free(msg);
+                var buf: std.ArrayList(u8) = .empty;
+                errdefer buf.deinit(allocator);
+                const w = buf.writer(allocator);
+                try w.writeAll("{\"status\":\"disambiguation_needed\",\"message\":\"");
+                try helpers.writeJsonEscaped(w, msg);
+                try w.writeAll("\"}");
+                return root.ToolResult{ .success = true, .output = try buf.toOwnedSlice(allocator) };
+            },
+            .not_found => {
+                var buf: std.ArrayList(u8) = .empty;
+                errdefer buf.deinit(allocator);
+                const w = buf.writer(allocator);
+                try w.writeAll("{\"error\":\"Contact not found\",\"query\":\"");
+                if (id) |the_id| {
+                    try helpers.writeJsonEscaped(w, the_id);
+                } else {
+                    try helpers.writeJsonEscaped(w, name.?);
+                }
+                try w.writeAll("\"}");
+                return root.ToolResult{ .success = false, .output = try buf.toOwnedSlice(allocator) };
+            },
+        }
     }
 
     fn lookupById(self: *GetContactTool, allocator: std.mem.Allocator, db: *c.sqlite3, contact_id: []const u8) !root.ToolResult {
@@ -61,101 +90,16 @@ pub const GetContactTool = struct {
 
         rc = c.sqlite3_step(stmt.?);
         if (rc != c.SQLITE_ROW) {
-            const msg = try std.fmt.allocPrint(allocator, "{{\"error\":\"Contact not found\",\"id\":\"{s}\"}}", .{contact_id});
-            return root.ToolResult{ .success = false, .output = msg };
+            var buf: std.ArrayList(u8) = .empty;
+            errdefer buf.deinit(allocator);
+            const w = buf.writer(allocator);
+            try w.writeAll("{\"error\":\"Contact not found\",\"id\":\"");
+            try helpers.writeJsonEscaped(w, contact_id);
+            try w.writeAll("\"}");
+            return root.ToolResult{ .success = false, .output = try buf.toOwnedSlice(allocator) };
         }
 
         return buildContactResult(allocator, db, stmt.?);
-    }
-
-    fn lookupByName(self: *GetContactTool, allocator: std.mem.Allocator, db: *c.sqlite3, name: []const u8) !root.ToolResult {
-        _ = self;
-        const sql =
-            \\SELECT ct.id, ct.name, ct.role, ct.email, ct.phone, ct.notes,
-            \\  ct.created_at, ct.updated_at, co.id, co.name, co.industry, co.size
-            \\FROM contacts ct LEFT JOIN companies co ON ct.company_id = co.id
-            \\WHERE ct.name LIKE ?1 COLLATE NOCASE;
-        ;
-
-        var stmt: ?*c.sqlite3_stmt = null;
-        var rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
-        if (rc != c.SQLITE_OK) return root.ToolResult.fail("Failed to prepare contact query");
-        defer _ = c.sqlite3_finalize(stmt);
-
-        const like_name = try std.fmt.allocPrint(allocator, "%{s}%", .{name});
-        defer allocator.free(like_name);
-        _ = c.sqlite3_bind_text(stmt, 1, like_name.ptr, @intCast(like_name.len), SQLITE_STATIC);
-
-        // Collect all matches
-        var matches: std.ArrayList(ContactMatch) = .empty;
-        defer {
-            for (matches.items) |m| {
-                allocator.free(m.id);
-                allocator.free(m.name);
-                allocator.free(m.company);
-                allocator.free(m.role);
-            }
-            matches.deinit(allocator);
-        }
-
-        while (c.sqlite3_step(stmt.?) == c.SQLITE_ROW) {
-            try matches.append(allocator, .{
-                .id = try allocator.dupe(u8, columnText(stmt.?, 0)),
-                .name = try allocator.dupe(u8, columnText(stmt.?, 1)),
-                .role = try allocator.dupe(u8, columnText(stmt.?, 2)),
-                .company = try allocator.dupe(u8, columnText(stmt.?, 9)),
-            });
-        }
-
-        if (matches.items.len == 0) {
-            const msg = try std.fmt.allocPrint(allocator, "{{\"error\":\"No contact found matching '{s}'\"}}", .{name});
-            return root.ToolResult{ .success = false, .output = msg };
-        }
-
-        if (matches.items.len > 1) {
-            // Disambiguation
-            var result: std.ArrayList(u8) = .empty;
-            errdefer result.deinit(allocator);
-
-            const header = try std.fmt.allocPrint(allocator,
-                \\{{"status":"disambiguation_needed","message":"Multiple contacts match '{s}'. Which one did you mean?","candidates":[
-            , .{name});
-            defer allocator.free(header);
-            try result.appendSlice(allocator, header);
-
-            for (matches.items, 0..) |m, i| {
-                if (i > 0) try result.append(allocator, ',');
-                const entry = try std.fmt.allocPrint(allocator,
-                    \\{{"id":"{s}","name":"{s}","company":"{s}","role":"{s}"}}
-                , .{ m.id, m.name, m.company, m.role });
-                defer allocator.free(entry);
-                try result.appendSlice(allocator, entry);
-            }
-            try result.appendSlice(allocator, "]}");
-            return root.ToolResult{ .success = true, .output = try result.toOwnedSlice(allocator) };
-        }
-
-        // Exactly one match — re-query to build full result
-        // Reset and reuse the ID from the match
-        const match_id = matches.items[0].id;
-
-        const sql2 =
-            \\SELECT ct.id, ct.name, ct.role, ct.email, ct.phone, ct.notes,
-            \\  ct.created_at, ct.updated_at, co.id, co.name, co.industry, co.size
-            \\FROM contacts ct LEFT JOIN companies co ON ct.company_id = co.id
-            \\WHERE ct.id = ?1;
-        ;
-
-        var stmt2: ?*c.sqlite3_stmt = null;
-        rc = c.sqlite3_prepare_v2(db, sql2, -1, &stmt2, null);
-        if (rc != c.SQLITE_OK) return root.ToolResult.fail("Failed to prepare contact query");
-        defer _ = c.sqlite3_finalize(stmt2);
-
-        _ = c.sqlite3_bind_text(stmt2, 1, match_id.ptr, @intCast(match_id.len), SQLITE_STATIC);
-        rc = c.sqlite3_step(stmt2.?);
-        if (rc != c.SQLITE_ROW) return root.ToolResult.fail("Contact not found after match");
-
-        return buildContactResult(allocator, db, stmt2.?);
     }
 
     fn buildContactResult(allocator: std.mem.Allocator, db: *c.sqlite3, stmt: *c.sqlite3_stmt) !root.ToolResult {
@@ -174,18 +118,39 @@ pub const GetContactTool = struct {
 
         var result: std.ArrayList(u8) = .empty;
         errdefer result.deinit(allocator);
+        const w = result.writer(allocator);
 
-        const contact_json = try std.fmt.allocPrint(allocator,
-            \\{{"contact":{{"id":"{s}","name":"{s}","role":"{s}","email":"{s}","phone":"{s}","notes":"{s}","created_at":"{s}","updated_at":"{s}"}},"company":{{"id":"{s}","name":"{s}","industry":"{s}","size":"{s}"}},"recent_activities":[
-        , .{ ct_id, ct_name, ct_role, ct_email, ct_phone, ct_notes, ct_created, ct_updated, co_id, co_name, co_industry, co_size });
-        defer allocator.free(contact_json);
-        try result.appendSlice(allocator, contact_json);
+        try w.writeAll("{\"contact\":{\"id\":\"");
+        try helpers.writeJsonEscaped(w, ct_id);
+        try w.writeAll("\",\"name\":\"");
+        try helpers.writeJsonEscaped(w, ct_name);
+        try w.writeAll("\",\"role\":\"");
+        try helpers.writeJsonEscaped(w, ct_role);
+        try w.writeAll("\",\"email\":\"");
+        try helpers.writeJsonEscaped(w, ct_email);
+        try w.writeAll("\",\"phone\":\"");
+        try helpers.writeJsonEscaped(w, ct_phone);
+        try w.writeAll("\",\"notes\":\"");
+        try helpers.writeJsonEscaped(w, ct_notes);
+        try w.writeAll("\",\"created_at\":\"");
+        try helpers.writeJsonEscaped(w, ct_created);
+        try w.writeAll("\",\"updated_at\":\"");
+        try helpers.writeJsonEscaped(w, ct_updated);
+        try w.writeAll("\"},\"company\":{\"id\":\"");
+        try helpers.writeJsonEscaped(w, co_id);
+        try w.writeAll("\",\"name\":\"");
+        try helpers.writeJsonEscaped(w, co_name);
+        try w.writeAll("\",\"industry\":\"");
+        try helpers.writeJsonEscaped(w, co_industry);
+        try w.writeAll("\",\"size\":\"");
+        try helpers.writeJsonEscaped(w, co_size);
+        try w.writeAll("\"},\"recent_activities\":[");
 
-        // Fetch recent activities (last 5)
+        // Fetch recent activities (last 10)
         const act_sql =
             \\SELECT id, type, summary, date, follow_up_date
             \\FROM activities WHERE contact_id = ?1
-            \\ORDER BY date DESC LIMIT 5;
+            \\ORDER BY date DESC LIMIT 10;
         ;
 
         var act_stmt: ?*c.sqlite3_stmt = null;
@@ -196,7 +161,7 @@ pub const GetContactTool = struct {
 
             var act_count: usize = 0;
             while (c.sqlite3_step(act_stmt.?) == c.SQLITE_ROW) {
-                if (act_count > 0) try result.append(allocator, ',');
+                if (act_count > 0) try w.writeByte(',');
 
                 const a_id = columnText(act_stmt.?, 0);
                 const a_type = columnText(act_stmt.?, 1);
@@ -204,25 +169,24 @@ pub const GetContactTool = struct {
                 const a_date = columnText(act_stmt.?, 3);
                 const a_followup = columnText(act_stmt.?, 4);
 
-                const entry = try std.fmt.allocPrint(allocator,
-                    \\{{"id":"{s}","type":"{s}","summary":"{s}","date":"{s}","follow_up_date":"{s}"}}
-                , .{ a_id, a_type, a_summary, a_date, a_followup });
-                defer allocator.free(entry);
-                try result.appendSlice(allocator, entry);
+                try w.writeAll("{\"id\":\"");
+                try helpers.writeJsonEscaped(w, a_id);
+                try w.writeAll("\",\"type\":\"");
+                try helpers.writeJsonEscaped(w, a_type);
+                try w.writeAll("\",\"summary\":\"");
+                try helpers.writeJsonEscaped(w, a_summary);
+                try w.writeAll("\",\"date\":\"");
+                try helpers.writeJsonEscaped(w, a_date);
+                try w.writeAll("\",\"follow_up_date\":\"");
+                try helpers.writeJsonEscaped(w, a_followup);
+                try w.writeAll("\"}");
                 act_count += 1;
             }
         }
 
-        try result.appendSlice(allocator, "]}");
+        try w.writeAll("]}");
         return root.ToolResult{ .success = true, .output = try result.toOwnedSlice(allocator) };
     }
-
-    const ContactMatch = struct {
-        id: []const u8,
-        name: []const u8,
-        role: []const u8,
-        company: []const u8,
-    };
 
     fn columnText(stmt: *c.sqlite3_stmt, col: c_int) []const u8 {
         const ptr = c.sqlite3_column_text(stmt, col);
@@ -324,7 +288,7 @@ test "get_contact by name disambiguation" {
     defer std.testing.allocator.free(result.output);
     try std.testing.expect(result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "disambiguation_needed") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "candidates") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "Which one did you mean?") != null);
 }
 
 test "get_contact not found" {

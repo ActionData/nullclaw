@@ -6,6 +6,7 @@ const schema = @import("schema.zig");
 const CrmDb = schema.CrmDb;
 const c = schema.c;
 const SQLITE_STATIC = schema.SQLITE_STATIC;
+const helpers = @import("save_company.zig");
 
 pub const UpdateDealStageTool = struct {
     db: ?*CrmDb = null,
@@ -78,8 +79,13 @@ pub const UpdateDealStageTool = struct {
             _ = c.sqlite3_bind_text(stmt, 1, did.ptr, @intCast(did.len), SQLITE_STATIC);
             rc = c.sqlite3_step(stmt.?);
             if (rc != c.SQLITE_ROW) {
-                const msg = try std.fmt.allocPrint(allocator, "{{\"error\":\"Deal not found\",\"id\":\"{s}\"}}", .{did});
-                return root.ToolResult{ .success = false, .output = msg };
+                var buf: std.ArrayList(u8) = .empty;
+                errdefer buf.deinit(allocator);
+                const bw = buf.writer(allocator);
+                try bw.writeAll("{\"error\":\"Deal not found\",\"id\":\"");
+                try helpers.writeJsonEscaped(bw, did);
+                try bw.writeAll("\"}");
+                return root.ToolResult{ .success = false, .output = try buf.toOwnedSlice(allocator) };
             }
 
             const id_text = columnText(stmt.?, 0);
@@ -105,8 +111,13 @@ pub const UpdateDealStageTool = struct {
 
             rc = c.sqlite3_step(stmt.?);
             if (rc != c.SQLITE_ROW) {
-                const msg = try std.fmt.allocPrint(allocator, "{{\"error\":\"No deal found matching '{s}'\"}}", .{deal_title.?});
-                return root.ToolResult{ .success = false, .output = msg };
+                var buf: std.ArrayList(u8) = .empty;
+                errdefer buf.deinit(allocator);
+                const bw = buf.writer(allocator);
+                try bw.writeAll("{\"error\":\"No deal found matching '");
+                try helpers.writeJsonEscaped(bw, deal_title.?);
+                try bw.writeAll("'\"}");
+                return root.ToolResult{ .success = false, .output = try buf.toOwnedSlice(allocator) };
             }
 
             const id_text = columnText(stmt.?, 0);
@@ -122,14 +133,24 @@ pub const UpdateDealStageTool = struct {
 
         // Check for no-op
         if (std.mem.eql(u8, current_stage, new_stage)) {
-            const msg = try std.fmt.allocPrint(allocator,
-                \\{{"status":"no_change","deal":{{"id":"{s}","title":"{s}","stage":"{s}"}},"message":"Deal is already in '{s}' stage"}}
-            , .{ resolved_id, resolved_title, current_stage, new_stage });
-            return root.ToolResult{ .success = true, .output = msg };
+            var buf: std.ArrayList(u8) = .empty;
+            errdefer buf.deinit(allocator);
+            const w = buf.writer(allocator);
+            try w.writeAll("{\"status\":\"no_change\",\"deal\":{\"id\":\"");
+            try helpers.writeJsonEscaped(w, resolved_id);
+            try w.writeAll("\",\"title\":\"");
+            try helpers.writeJsonEscaped(w, resolved_title);
+            try w.writeAll("\",\"stage\":\"");
+            try helpers.writeJsonEscaped(w, current_stage);
+            try w.writeAll("\"},\"message\":\"Deal is already in '");
+            try helpers.writeJsonEscaped(w, new_stage);
+            try w.writeAll("' stage\"}");
+            return root.ToolResult{ .success = true, .output = try buf.toOwnedSlice(allocator) };
         }
 
         // Update deal stage and updated_at
-        const update_sql = "UPDATE deals SET stage = ?1, updated_at = datetime('now') WHERE id = ?2;";
+        const now = helpers.nowIso8601();
+        const update_sql = "UPDATE deals SET stage = ?1, updated_at = ?3 WHERE id = ?2;";
         var update_stmt: ?*c.sqlite3_stmt = null;
         var rc = c.sqlite3_prepare_v2(db, update_sql, -1, &update_stmt, null);
         if (rc != c.SQLITE_OK) return root.ToolResult.fail("Failed to prepare update");
@@ -137,6 +158,7 @@ pub const UpdateDealStageTool = struct {
 
         _ = c.sqlite3_bind_text(update_stmt, 1, new_stage.ptr, @intCast(new_stage.len), SQLITE_STATIC);
         _ = c.sqlite3_bind_text(update_stmt, 2, resolved_id.ptr, @intCast(resolved_id.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(update_stmt, 3, &now, now.len, SQLITE_STATIC);
 
         rc = c.sqlite3_step(update_stmt.?);
         if (rc != c.SQLITE_DONE) return root.ToolResult.fail("Failed to update deal stage");
@@ -145,7 +167,7 @@ pub const UpdateDealStageTool = struct {
         const hist_id = crm_db.generateUuid();
         const hist_sql =
             \\INSERT INTO stage_history (id, deal_id, from_stage, to_stage, notes, changed_at)
-            \\VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'));
+            \\VALUES (?1, ?2, ?3, ?4, ?5, ?6);
         ;
         var hist_stmt: ?*c.sqlite3_stmt = null;
         rc = c.sqlite3_prepare_v2(db, hist_sql, -1, &hist_stmt, null);
@@ -157,14 +179,32 @@ pub const UpdateDealStageTool = struct {
         _ = c.sqlite3_bind_text(hist_stmt, 3, current_stage.ptr, @intCast(current_stage.len), SQLITE_STATIC);
         _ = c.sqlite3_bind_text(hist_stmt, 4, new_stage.ptr, @intCast(new_stage.len), SQLITE_STATIC);
         _ = c.sqlite3_bind_text(hist_stmt, 5, notes.ptr, @intCast(notes.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(hist_stmt, 6, &now, now.len, SQLITE_STATIC);
 
         rc = c.sqlite3_step(hist_stmt.?);
         if (rc != c.SQLITE_DONE) return root.ToolResult.fail("Failed to insert stage history");
 
-        const msg = try std.fmt.allocPrint(allocator,
-            \\{{"status":"updated","deal":{{"id":"{s}","title":"{s}","stage":"{s}","previous_stage":"{s}"}},"stage_history_entry":{{"id":"{s}","from_stage":"{s}","to_stage":"{s}","notes":"{s}"}}}}
-        , .{ resolved_id, resolved_title, new_stage, current_stage, &hist_id, current_stage, new_stage, notes });
-        return root.ToolResult{ .success = true, .output = msg };
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(allocator);
+        const w = buf.writer(allocator);
+        try w.writeAll("{\"status\":\"updated\",\"deal\":{\"id\":\"");
+        try helpers.writeJsonEscaped(w, resolved_id);
+        try w.writeAll("\",\"title\":\"");
+        try helpers.writeJsonEscaped(w, resolved_title);
+        try w.writeAll("\",\"stage\":\"");
+        try helpers.writeJsonEscaped(w, new_stage);
+        try w.writeAll("\",\"previous_stage\":\"");
+        try helpers.writeJsonEscaped(w, current_stage);
+        try w.writeAll("\"},\"stage_history_entry\":{\"id\":\"");
+        try w.writeAll(&hist_id);
+        try w.writeAll("\",\"from_stage\":\"");
+        try helpers.writeJsonEscaped(w, current_stage);
+        try w.writeAll("\",\"to_stage\":\"");
+        try helpers.writeJsonEscaped(w, new_stage);
+        try w.writeAll("\",\"notes\":\"");
+        try helpers.writeJsonEscaped(w, notes);
+        try w.writeAll("\"}}");
+        return root.ToolResult{ .success = true, .output = try buf.toOwnedSlice(allocator) };
     }
 
     fn columnText(stmt: *c.sqlite3_stmt, col: c_int) []const u8 {

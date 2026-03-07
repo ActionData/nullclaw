@@ -7,6 +7,7 @@ const schema = @import("schema.zig");
 const CrmDb = schema.CrmDb;
 const c = schema.c;
 const helpers = @import("save_company.zig");
+const resolve = @import("resolve.zig");
 
 pub const LogActivityTool = struct {
     db: ?*CrmDb = null,
@@ -42,25 +43,73 @@ pub const LogActivityTool = struct {
         const summary = root.getString(args, "summary") orelse return root.ToolResult.fail("Missing required parameter: summary");
         if (summary.len == 0) return root.ToolResult.fail("'summary' must not be empty");
 
+        // Resolve company first (needed for scoping contact resolution)
+        var company_id: ?[]const u8 = root.getString(args, "company_id");
+        const company_name = root.getString(args, "company");
+        if (company_id == null and company_name != null) {
+            var company_result = try resolve.resolveCompany(db_inst, allocator, company_name.?, null);
+            defer resolve.freeResult(allocator, &company_result);
+            switch (company_result) {
+                .resolved => |r| company_id = r.id,
+                .ambiguous => |candidates| {
+                    const msg = try resolve.formatCandidates(allocator, candidates, "company");
+                    defer allocator.free(msg);
+                    var buf: std.ArrayList(u8) = .empty;
+                    errdefer buf.deinit(allocator);
+                    const w = buf.writer(allocator);
+                    try w.writeAll("{\"status\":\"disambiguation_needed\",\"message\":\"");
+                    try helpers.writeJsonEscaped(w, msg);
+                    try w.writeAll("\"}");
+                    return root.ToolResult{ .success = true, .output = try buf.toOwnedSlice(allocator) };
+                },
+                .not_found => {},
+            }
+        }
+
         // Resolve contact
         var contact_id: ?[]const u8 = root.getString(args, "contact_id");
         const contact_name = root.getString(args, "contact");
         if (contact_id == null and contact_name != null) {
-            contact_id = resolveByName(db, "contacts", contact_name.?);
+            var contact_result = try resolve.resolveContact(db_inst, allocator, contact_name.?, null, company_id);
+            defer resolve.freeResult(allocator, &contact_result);
+            switch (contact_result) {
+                .resolved => |r| contact_id = r.id,
+                .ambiguous => |candidates| {
+                    const msg = try resolve.formatCandidates(allocator, candidates, "contact");
+                    defer allocator.free(msg);
+                    var buf: std.ArrayList(u8) = .empty;
+                    errdefer buf.deinit(allocator);
+                    const w = buf.writer(allocator);
+                    try w.writeAll("{\"status\":\"disambiguation_needed\",\"message\":\"");
+                    try helpers.writeJsonEscaped(w, msg);
+                    try w.writeAll("\"}");
+                    return root.ToolResult{ .success = true, .output = try buf.toOwnedSlice(allocator) };
+                },
+                .not_found => {},
+            }
         }
 
         // Resolve deal (by title)
         var deal_id: ?[]const u8 = root.getString(args, "deal_id");
         const deal_title = root.getString(args, "deal");
         if (deal_id == null and deal_title != null) {
-            deal_id = resolveByTitle(db, deal_title.?);
-        }
-
-        // Resolve company
-        var company_id: ?[]const u8 = root.getString(args, "company_id");
-        const company_name = root.getString(args, "company");
-        if (company_id == null and company_name != null) {
-            company_id = resolveByName(db, "companies", company_name.?);
+            var deal_result = try resolve.resolveDeal(db_inst, allocator, deal_title.?, null, company_id);
+            defer resolve.freeResult(allocator, &deal_result);
+            switch (deal_result) {
+                .resolved => |r| deal_id = r.id,
+                .ambiguous => |candidates| {
+                    const msg = try resolve.formatCandidates(allocator, candidates, "deal");
+                    defer allocator.free(msg);
+                    var buf: std.ArrayList(u8) = .empty;
+                    errdefer buf.deinit(allocator);
+                    const w = buf.writer(allocator);
+                    try w.writeAll("{\"status\":\"disambiguation_needed\",\"message\":\"");
+                    try helpers.writeJsonEscaped(w, msg);
+                    try w.writeAll("\"}");
+                    return root.ToolResult{ .success = true, .output = try buf.toOwnedSlice(allocator) };
+                },
+                .not_found => {},
+            }
         }
 
         const rep_id = root.getString(args, "rep_id");
@@ -100,43 +149,6 @@ pub const LogActivityTool = struct {
         if (rc != c.SQLITE_DONE) return root.ToolResult.fail("Failed to insert activity");
 
         return fetchAndReturnActivity(allocator, db, &uuid);
-    }
-
-    fn resolveByName(db: *c.sqlite3, table: []const u8, name: []const u8) ?[]const u8 {
-        var sql_buf: [128]u8 = undefined;
-        const sql_len = std.fmt.bufPrint(&sql_buf, "SELECT id FROM {s} WHERE name = ?1 COLLATE NOCASE LIMIT 1;", .{table}) catch return null;
-        var sql_z: [129]u8 = undefined;
-        @memcpy(sql_z[0..sql_len.len], sql_len);
-        sql_z[sql_len.len] = 0;
-
-        var stmt: ?*c.sqlite3_stmt = null;
-        var rc = c.sqlite3_prepare_v2(db, &sql_z, -1, &stmt, null);
-        if (rc != c.SQLITE_OK) return null;
-        defer _ = c.sqlite3_finalize(stmt);
-
-        _ = c.sqlite3_bind_text(stmt, 1, name.ptr, @intCast(name.len), schema.SQLITE_STATIC);
-        rc = c.sqlite3_step(stmt.?);
-        if (rc != c.SQLITE_ROW) return null;
-
-        const raw = c.sqlite3_column_text(stmt.?, 0);
-        if (raw == null) return null;
-        return std.mem.span(raw);
-    }
-
-    fn resolveByTitle(db: *c.sqlite3, title: []const u8) ?[]const u8 {
-        const sql = "SELECT id FROM deals WHERE title = ?1 COLLATE NOCASE LIMIT 1;";
-        var stmt: ?*c.sqlite3_stmt = null;
-        var rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
-        if (rc != c.SQLITE_OK) return null;
-        defer _ = c.sqlite3_finalize(stmt);
-
-        _ = c.sqlite3_bind_text(stmt, 1, title.ptr, @intCast(title.len), schema.SQLITE_STATIC);
-        rc = c.sqlite3_step(stmt.?);
-        if (rc != c.SQLITE_ROW) return null;
-
-        const raw = c.sqlite3_column_text(stmt.?, 0);
-        if (raw == null) return null;
-        return std.mem.span(raw);
     }
 
     fn fetchAndReturnActivity(allocator: std.mem.Allocator, db: *c.sqlite3, id: []const u8) !root.ToolResult {

@@ -6,6 +6,8 @@ const schema = @import("schema.zig");
 const CrmDb = schema.CrmDb;
 const c = schema.c;
 const SQLITE_STATIC = schema.SQLITE_STATIC;
+const resolve = @import("resolve.zig");
+const helpers = @import("save_company.zig");
 
 pub const GetDealTool = struct {
     db: ?*CrmDb = null,
@@ -37,12 +39,39 @@ pub const GetDealTool = struct {
             return root.ToolResult.fail("CRM database not open");
 
         // Resolution priority: id > title > company
-        if (id) |deal_id| {
-            return self.lookupById(allocator, db, deal_id);
-        }
+        if (id != null or title != null) {
+            var result = try resolve.resolveDeal(crm_db, allocator, title, id, null);
+            defer resolve.freeResult(allocator, &result);
 
-        if (title) |deal_title| {
-            return self.lookupByTitle(allocator, db, deal_title);
+            switch (result) {
+                .resolved => |r| {
+                    return self.lookupById(allocator, db, r.id);
+                },
+                .ambiguous => |candidates| {
+                    const msg = try resolve.formatCandidates(allocator, candidates, "deal");
+                    defer allocator.free(msg);
+                    var buf: std.ArrayList(u8) = .empty;
+                    errdefer buf.deinit(allocator);
+                    const w = buf.writer(allocator);
+                    try w.writeAll("{\"status\":\"disambiguation_needed\",\"message\":\"");
+                    try helpers.writeJsonEscaped(w, msg);
+                    try w.writeAll("\"}");
+                    return root.ToolResult{ .success = true, .output = try buf.toOwnedSlice(allocator) };
+                },
+                .not_found => {
+                    var buf: std.ArrayList(u8) = .empty;
+                    errdefer buf.deinit(allocator);
+                    const w = buf.writer(allocator);
+                    try w.writeAll("{\"error\":\"Deal not found\",\"query\":\"");
+                    if (id) |the_id| {
+                        try helpers.writeJsonEscaped(w, the_id);
+                    } else {
+                        try helpers.writeJsonEscaped(w, title.?);
+                    }
+                    try w.writeAll("\"}");
+                    return root.ToolResult{ .success = false, .output = try buf.toOwnedSlice(allocator) };
+                },
+            }
         }
 
         // Company-only: return all deals for that company
@@ -70,38 +99,13 @@ pub const GetDealTool = struct {
 
         rc = c.sqlite3_step(stmt.?);
         if (rc != c.SQLITE_ROW) {
-            const msg = try std.fmt.allocPrint(allocator, "{{\"error\":\"Deal not found\",\"id\":\"{s}\"}}", .{deal_id});
-            return root.ToolResult{ .success = false, .output = msg };
-        }
-
-        return buildDealResult(allocator, db, stmt.?);
-    }
-
-    fn lookupByTitle(self: *GetDealTool, allocator: std.mem.Allocator, db: *c.sqlite3, title: []const u8) !root.ToolResult {
-        _ = self;
-        const sql =
-            \\SELECT d.id, d.title, d.stage, d.value, d.currency, d.close_date,
-            \\  d.next_step, d.notes, d.created_at, d.updated_at,
-            \\  co.id, co.name, ct.id, ct.name, ct.role
-            \\FROM deals d
-            \\LEFT JOIN companies co ON d.company_id = co.id
-            \\LEFT JOIN contacts ct ON d.contact_id = ct.id
-            \\WHERE d.title LIKE ?1 COLLATE NOCASE;
-        ;
-
-        var stmt: ?*c.sqlite3_stmt = null;
-        var rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
-        if (rc != c.SQLITE_OK) return root.ToolResult.fail("Failed to prepare deal query");
-        defer _ = c.sqlite3_finalize(stmt);
-
-        const like_title = try std.fmt.allocPrint(allocator, "%{s}%", .{title});
-        defer allocator.free(like_title);
-        _ = c.sqlite3_bind_text(stmt, 1, like_title.ptr, @intCast(like_title.len), SQLITE_STATIC);
-
-        rc = c.sqlite3_step(stmt.?);
-        if (rc != c.SQLITE_ROW) {
-            const msg = try std.fmt.allocPrint(allocator, "{{\"error\":\"No deal found matching '{s}'\"}}", .{title});
-            return root.ToolResult{ .success = false, .output = msg };
+            var buf: std.ArrayList(u8) = .empty;
+            errdefer buf.deinit(allocator);
+            const w = buf.writer(allocator);
+            try w.writeAll("{\"error\":\"Deal not found\",\"id\":\"");
+            try helpers.writeJsonEscaped(w, deal_id);
+            try w.writeAll("\"}");
+            return root.ToolResult{ .success = false, .output = try buf.toOwnedSlice(allocator) };
         }
 
         return buildDealResult(allocator, db, stmt.?);
@@ -131,12 +135,13 @@ pub const GetDealTool = struct {
         // Collect all deals for this company
         var result: std.ArrayList(u8) = .empty;
         errdefer result.deinit(allocator);
+        const w = result.writer(allocator);
 
-        try result.appendSlice(allocator, "{\"deals\":[");
+        try w.writeAll("{\"deals\":[");
 
         var count: usize = 0;
         while (c.sqlite3_step(stmt.?) == c.SQLITE_ROW) {
-            if (count > 0) try result.append(allocator, ',');
+            if (count > 0) try w.writeByte(',');
 
             const d_id = columnText(stmt.?, 0);
             const d_title = columnText(stmt.?, 1);
@@ -146,23 +151,40 @@ pub const GetDealTool = struct {
             const co_name = columnText(stmt.?, 11);
             const ct_name = columnText(stmt.?, 13);
 
-            const entry = try std.fmt.allocPrint(allocator,
-                \\{{"id":"{s}","title":"{s}","stage":"{s}","value":{d:.2},"currency":"{s}","company":"{s}","contact":"{s}"}}
-            , .{ d_id, d_title, d_stage, d_value, d_currency, co_name, ct_name });
-            defer allocator.free(entry);
-            try result.appendSlice(allocator, entry);
+            try w.writeAll("{\"id\":\"");
+            try helpers.writeJsonEscaped(w, d_id);
+            try w.writeAll("\",\"title\":\"");
+            try helpers.writeJsonEscaped(w, d_title);
+            try w.writeAll("\",\"stage\":\"");
+            try helpers.writeJsonEscaped(w, d_stage);
+            try w.writeAll("\",\"value\":");
+            try std.fmt.format(w, "{d:.2}", .{d_value});
+            try w.writeAll(",\"currency\":\"");
+            try helpers.writeJsonEscaped(w, d_currency);
+            try w.writeAll("\",\"company\":\"");
+            try helpers.writeJsonEscaped(w, co_name);
+            try w.writeAll("\",\"contact\":\"");
+            try helpers.writeJsonEscaped(w, ct_name);
+            try w.writeAll("\"}");
             count += 1;
         }
 
         if (count == 0) {
             result.deinit(allocator);
-            const msg = try std.fmt.allocPrint(allocator, "{{\"error\":\"No deals found for company '{s}'\"}}", .{company});
-            return root.ToolResult{ .success = false, .output = msg };
+            var buf: std.ArrayList(u8) = .empty;
+            errdefer buf.deinit(allocator);
+            const bw = buf.writer(allocator);
+            try bw.writeAll("{\"error\":\"No deals found for company '");
+            try helpers.writeJsonEscaped(bw, company);
+            try bw.writeAll("'\"}");
+            return root.ToolResult{ .success = false, .output = try buf.toOwnedSlice(allocator) };
         }
 
-        const tail = try std.fmt.allocPrint(allocator, "],\"total\":{d},\"company\":\"{s}\"}}", .{ count, company });
-        defer allocator.free(tail);
-        try result.appendSlice(allocator, tail);
+        try w.writeAll("],\"total\":");
+        try std.fmt.format(w, "{d}", .{count});
+        try w.writeAll(",\"company\":\"");
+        try helpers.writeJsonEscaped(w, company);
+        try w.writeAll("\"}");
 
         return root.ToolResult{ .success = true, .output = try result.toOwnedSlice(allocator) };
     }
@@ -186,18 +208,45 @@ pub const GetDealTool = struct {
 
         var result: std.ArrayList(u8) = .empty;
         errdefer result.deinit(allocator);
+        const w = result.writer(allocator);
 
-        const deal_json = try std.fmt.allocPrint(allocator,
-            \\{{"deal":{{"id":"{s}","title":"{s}","stage":"{s}","value":{d:.2},"currency":"{s}","close_date":"{s}","next_step":"{s}","notes":"{s}","created_at":"{s}","updated_at":"{s}"}},"company":{{"id":"{s}","name":"{s}"}},"contact":{{"id":"{s}","name":"{s}","role":"{s}"}},"recent_activities":[
-        , .{ d_id, d_title, d_stage, d_value, d_currency, d_close_date, d_next_step, d_notes, d_created, d_updated, co_id, co_name, ct_id, ct_name, ct_role });
-        defer allocator.free(deal_json);
-        try result.appendSlice(allocator, deal_json);
+        try w.writeAll("{\"deal\":{\"id\":\"");
+        try helpers.writeJsonEscaped(w, d_id);
+        try w.writeAll("\",\"title\":\"");
+        try helpers.writeJsonEscaped(w, d_title);
+        try w.writeAll("\",\"stage\":\"");
+        try helpers.writeJsonEscaped(w, d_stage);
+        try w.writeAll("\",\"value\":");
+        try std.fmt.format(w, "{d:.2}", .{d_value});
+        try w.writeAll(",\"currency\":\"");
+        try helpers.writeJsonEscaped(w, d_currency);
+        try w.writeAll("\",\"close_date\":\"");
+        try helpers.writeJsonEscaped(w, d_close_date);
+        try w.writeAll("\",\"next_step\":\"");
+        try helpers.writeJsonEscaped(w, d_next_step);
+        try w.writeAll("\",\"notes\":\"");
+        try helpers.writeJsonEscaped(w, d_notes);
+        try w.writeAll("\",\"created_at\":\"");
+        try helpers.writeJsonEscaped(w, d_created);
+        try w.writeAll("\",\"updated_at\":\"");
+        try helpers.writeJsonEscaped(w, d_updated);
+        try w.writeAll("\"},\"company\":{\"id\":\"");
+        try helpers.writeJsonEscaped(w, co_id);
+        try w.writeAll("\",\"name\":\"");
+        try helpers.writeJsonEscaped(w, co_name);
+        try w.writeAll("\"},\"contact\":{\"id\":\"");
+        try helpers.writeJsonEscaped(w, ct_id);
+        try w.writeAll("\",\"name\":\"");
+        try helpers.writeJsonEscaped(w, ct_name);
+        try w.writeAll("\",\"role\":\"");
+        try helpers.writeJsonEscaped(w, ct_role);
+        try w.writeAll("\"},\"recent_activities\":[");
 
-        // Fetch recent activities (last 5)
+        // Fetch recent activities (last 10)
         const act_sql =
             \\SELECT id, type, summary, date, follow_up_date
             \\FROM activities WHERE deal_id = ?1
-            \\ORDER BY date DESC LIMIT 5;
+            \\ORDER BY date DESC LIMIT 10;
         ;
 
         var act_stmt: ?*c.sqlite3_stmt = null;
@@ -208,7 +257,7 @@ pub const GetDealTool = struct {
 
             var act_count: usize = 0;
             while (c.sqlite3_step(act_stmt.?) == c.SQLITE_ROW) {
-                if (act_count > 0) try result.append(allocator, ',');
+                if (act_count > 0) try w.writeByte(',');
 
                 const a_id = columnText(act_stmt.?, 0);
                 const a_type = columnText(act_stmt.?, 1);
@@ -216,16 +265,22 @@ pub const GetDealTool = struct {
                 const a_date = columnText(act_stmt.?, 3);
                 const a_followup = columnText(act_stmt.?, 4);
 
-                const entry = try std.fmt.allocPrint(allocator,
-                    \\{{"id":"{s}","type":"{s}","summary":"{s}","date":"{s}","follow_up_date":"{s}"}}
-                , .{ a_id, a_type, a_summary, a_date, a_followup });
-                defer allocator.free(entry);
-                try result.appendSlice(allocator, entry);
+                try w.writeAll("{\"id\":\"");
+                try helpers.writeJsonEscaped(w, a_id);
+                try w.writeAll("\",\"type\":\"");
+                try helpers.writeJsonEscaped(w, a_type);
+                try w.writeAll("\",\"summary\":\"");
+                try helpers.writeJsonEscaped(w, a_summary);
+                try w.writeAll("\",\"date\":\"");
+                try helpers.writeJsonEscaped(w, a_date);
+                try w.writeAll("\",\"follow_up_date\":\"");
+                try helpers.writeJsonEscaped(w, a_followup);
+                try w.writeAll("\"}");
                 act_count += 1;
             }
         }
 
-        try result.appendSlice(allocator, "],\"stage_history\":[");
+        try w.writeAll("],\"stage_history\":[");
 
         // Fetch stage history
         const hist_sql =
@@ -242,23 +297,27 @@ pub const GetDealTool = struct {
 
             var hist_count: usize = 0;
             while (c.sqlite3_step(hist_stmt.?) == c.SQLITE_ROW) {
-                if (hist_count > 0) try result.append(allocator, ',');
+                if (hist_count > 0) try w.writeByte(',');
 
                 const from = columnText(hist_stmt.?, 0);
                 const to = columnText(hist_stmt.?, 1);
-                const notes = columnText(hist_stmt.?, 2);
+                const hist_notes = columnText(hist_stmt.?, 2);
                 const changed = columnText(hist_stmt.?, 3);
 
-                const entry = try std.fmt.allocPrint(allocator,
-                    \\{{"from_stage":"{s}","to_stage":"{s}","notes":"{s}","changed_at":"{s}"}}
-                , .{ from, to, notes, changed });
-                defer allocator.free(entry);
-                try result.appendSlice(allocator, entry);
+                try w.writeAll("{\"from_stage\":\"");
+                try helpers.writeJsonEscaped(w, from);
+                try w.writeAll("\",\"to_stage\":\"");
+                try helpers.writeJsonEscaped(w, to);
+                try w.writeAll("\",\"notes\":\"");
+                try helpers.writeJsonEscaped(w, hist_notes);
+                try w.writeAll("\",\"changed_at\":\"");
+                try helpers.writeJsonEscaped(w, changed);
+                try w.writeAll("\"}");
                 hist_count += 1;
             }
         }
 
-        try result.appendSlice(allocator, "]}");
+        try w.writeAll("]}");
         return root.ToolResult{ .success = true, .output = try result.toOwnedSlice(allocator) };
     }
 

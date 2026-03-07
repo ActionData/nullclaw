@@ -7,6 +7,7 @@ const schema = @import("schema.zig");
 const CrmDb = schema.CrmDb;
 const c = schema.c;
 const helpers = @import("save_company.zig");
+const resolve = @import("resolve.zig");
 
 pub const SaveDealTool = struct {
     db: ?*CrmDb = null,
@@ -46,14 +47,46 @@ pub const SaveDealTool = struct {
         var company_id: ?[]const u8 = root.getString(args, "company_id");
         const company_name = root.getString(args, "company");
         if (company_id == null and company_name != null) {
-            company_id = resolveByName(db, "companies", company_name.?);
+            var company_result = try resolve.resolveCompany(db_inst, allocator, company_name.?, null);
+            defer resolve.freeResult(allocator, &company_result);
+            switch (company_result) {
+                .resolved => |r| company_id = r.id,
+                .ambiguous => |candidates| {
+                    const msg = try resolve.formatCandidates(allocator, candidates, "company");
+                    defer allocator.free(msg);
+                    var buf: std.ArrayList(u8) = .empty;
+                    errdefer buf.deinit(allocator);
+                    const w = buf.writer(allocator);
+                    try w.writeAll("{\"status\":\"disambiguation_needed\",\"message\":\"");
+                    try helpers.writeJsonEscaped(w, msg);
+                    try w.writeAll("\"}");
+                    return root.ToolResult{ .success = true, .output = try buf.toOwnedSlice(allocator) };
+                },
+                .not_found => {},
+            }
         }
 
         // Resolve contact
         var contact_id: ?[]const u8 = root.getString(args, "contact_id");
         const contact_name = root.getString(args, "contact");
         if (contact_id == null and contact_name != null) {
-            contact_id = resolveByName(db, "contacts", contact_name.?);
+            var contact_result = try resolve.resolveContact(db_inst, allocator, contact_name.?, null, company_id);
+            defer resolve.freeResult(allocator, &contact_result);
+            switch (contact_result) {
+                .resolved => |r| contact_id = r.id,
+                .ambiguous => |candidates| {
+                    const msg = try resolve.formatCandidates(allocator, candidates, "contact");
+                    defer allocator.free(msg);
+                    var buf: std.ArrayList(u8) = .empty;
+                    errdefer buf.deinit(allocator);
+                    const w = buf.writer(allocator);
+                    try w.writeAll("{\"status\":\"disambiguation_needed\",\"message\":\"");
+                    try helpers.writeJsonEscaped(w, msg);
+                    try w.writeAll("\"}");
+                    return root.ToolResult{ .success = true, .output = try buf.toOwnedSlice(allocator) };
+                },
+                .not_found => {},
+            }
         }
 
         // Extract deal value (can be integer or float in JSON)
@@ -71,61 +104,32 @@ pub const SaveDealTool = struct {
         const next_step = root.getString(args, "next_step");
         const notes = root.getString(args, "notes");
 
-        // Search for existing deals by title (case-insensitive)
-        const candidates = try searchByTitle(allocator, db, title);
-        defer {
-            for (candidates) |cand| allocator.free(cand.id);
-            allocator.free(candidates);
+        // Resolve existing deal by title using tiered matching
+        var deal_result = try resolve.resolveDeal(db_inst, allocator, title, null, company_id);
+        defer resolve.freeResult(allocator, &deal_result);
+
+        switch (deal_result) {
+            .ambiguous => |candidates| {
+                const msg = try resolve.formatCandidates(allocator, candidates, "deal");
+                defer allocator.free(msg);
+                var buf: std.ArrayList(u8) = .empty;
+                errdefer buf.deinit(allocator);
+                const w = buf.writer(allocator);
+                try w.writeAll("{\"status\":\"disambiguation_needed\",\"message\":\"");
+                try helpers.writeJsonEscaped(w, msg);
+                try w.writeAll("\"}");
+                return root.ToolResult{ .success = true, .output = try buf.toOwnedSlice(allocator) };
+            },
+            .resolved => |r| {
+                // Need to fetch deal details for update (old stage, etc.)
+                const existing = try fetchDealCandidate(allocator, db, r.id);
+                defer allocator.free(existing.id);
+                return updateDeal(allocator, db_inst, db, existing, title, company_id, contact_id, stage, value, currency, close_date, next_step, notes);
+            },
+            .not_found => {
+                return createDeal(allocator, db_inst, db, title, company_id, contact_id, stage, value, currency, close_date, next_step, notes);
+            },
         }
-
-        if (candidates.len > 1) {
-            return buildDisambiguationResponse(allocator, title, candidates);
-        }
-
-        if (candidates.len == 1) {
-            return updateDeal(allocator, db_inst, db, candidates[0], title, company_id, contact_id, stage, value, currency, close_date, next_step, notes);
-        }
-
-        return createDeal(allocator, db_inst, db, title, company_id, contact_id, stage, value, currency, close_date, next_step, notes);
-    }
-
-    fn resolveByName(db: *c.sqlite3, table: []const u8, name: []const u8) ?[]const u8 {
-        // Build query — table name is a comptime-known string literal, safe to embed
-        var sql_buf: [128]u8 = undefined;
-        const sql_len = std.fmt.bufPrint(&sql_buf, "SELECT id FROM {s} WHERE name = ?1 COLLATE NOCASE LIMIT 1;", .{table}) catch return null;
-        // Need null terminator
-        var sql_z: [129]u8 = undefined;
-        @memcpy(sql_z[0..sql_len.len], sql_len);
-        sql_z[sql_len.len] = 0;
-
-        var stmt: ?*c.sqlite3_stmt = null;
-        var rc = c.sqlite3_prepare_v2(db, &sql_z, -1, &stmt, null);
-        if (rc != c.SQLITE_OK) return null;
-        defer _ = c.sqlite3_finalize(stmt);
-
-        _ = c.sqlite3_bind_text(stmt, 1, name.ptr, @intCast(name.len), schema.SQLITE_STATIC);
-        rc = c.sqlite3_step(stmt.?);
-        if (rc != c.SQLITE_ROW) return null;
-
-        const raw = c.sqlite3_column_text(stmt.?, 0);
-        if (raw == null) return null;
-        return std.mem.span(raw);
-    }
-
-    fn resolveByTitle(db: *c.sqlite3, name: []const u8) ?[]const u8 {
-        const sql = "SELECT id FROM deals WHERE title = ?1 COLLATE NOCASE LIMIT 1;";
-        var stmt: ?*c.sqlite3_stmt = null;
-        var rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
-        if (rc != c.SQLITE_OK) return null;
-        defer _ = c.sqlite3_finalize(stmt);
-
-        _ = c.sqlite3_bind_text(stmt, 1, name.ptr, @intCast(name.len), schema.SQLITE_STATIC);
-        rc = c.sqlite3_step(stmt.?);
-        if (rc != c.SQLITE_ROW) return null;
-
-        const raw = c.sqlite3_column_text(stmt.?, 0);
-        if (raw == null) return null;
-        return std.mem.span(raw);
     }
 
     const DealCandidate = struct {
@@ -135,59 +139,27 @@ pub const SaveDealTool = struct {
         company_id: [*c]const u8,
     };
 
-    fn searchByTitle(allocator: std.mem.Allocator, db: *c.sqlite3, title: []const u8) ![]DealCandidate {
-        const sql = "SELECT id, title, stage, company_id FROM deals WHERE title = ?1 COLLATE NOCASE;";
+    fn fetchDealCandidate(allocator: std.mem.Allocator, db: *c.sqlite3, id: []const u8) !DealCandidate {
+        const sql = "SELECT id, title, stage, company_id FROM deals WHERE id = ?1;";
         var stmt: ?*c.sqlite3_stmt = null;
-        const rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
+        var rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
         if (rc != c.SQLITE_OK) return error.SqlitePrepareFailed;
         defer _ = c.sqlite3_finalize(stmt);
 
-        _ = c.sqlite3_bind_text(stmt, 1, title.ptr, @intCast(title.len), schema.SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 1, id.ptr, @intCast(id.len), schema.SQLITE_STATIC);
+        rc = c.sqlite3_step(stmt.?);
+        if (rc != c.SQLITE_ROW) return error.DealNotFound;
 
-        var list: std.ArrayList(DealCandidate) = .empty;
-        errdefer {
-            for (list.items) |item| allocator.free(item.id);
-            list.deinit(allocator);
-        }
+        const id_raw = c.sqlite3_column_text(stmt.?, 0);
+        if (id_raw == null) return error.DealNotFound;
+        const id_copy = try allocator.dupe(u8, std.mem.span(id_raw));
 
-        while (c.sqlite3_step(stmt.?) == c.SQLITE_ROW) {
-            const id_raw = c.sqlite3_column_text(stmt.?, 0);
-            if (id_raw == null) continue;
-            const id_copy = try allocator.dupe(u8, std.mem.span(id_raw));
-
-            try list.append(allocator, .{
-                .id = id_copy,
-                .title = c.sqlite3_column_text(stmt.?, 1),
-                .stage = c.sqlite3_column_text(stmt.?, 2),
-                .company_id = c.sqlite3_column_text(stmt.?, 3),
-            });
-        }
-        return list.toOwnedSlice(allocator);
-    }
-
-    fn buildDisambiguationResponse(allocator: std.mem.Allocator, title: []const u8, candidates: []const DealCandidate) !root.ToolResult {
-        var buf: std.ArrayList(u8) = .empty;
-        errdefer buf.deinit(allocator);
-        const w = buf.writer(allocator);
-
-        try w.writeAll("{\"status\":\"disambiguation_needed\",\"message\":\"Multiple deals match '");
-        try helpers.writeJsonEscaped(w, title);
-        try w.writeAll("'. Please confirm which one, or indicate this is a new deal.\",\"candidates\":[");
-
-        for (candidates, 0..) |cand, i| {
-            if (i > 0) try w.writeByte(',');
-            try w.writeAll("{\"id\":\"");
-            try w.writeAll(cand.id);
-            try w.writeAll("\",\"title\":");
-            try helpers.writeNullableJsonC(w, cand.title);
-            try w.writeAll(",\"stage\":");
-            try helpers.writeNullableJsonC(w, cand.stage);
-            try w.writeAll(",\"company_id\":");
-            try helpers.writeNullableJsonC(w, cand.company_id);
-            try w.writeByte('}');
-        }
-        try w.writeAll("]}");
-        return root.ToolResult{ .success = true, .output = try buf.toOwnedSlice(allocator) };
+        return .{
+            .id = id_copy,
+            .title = c.sqlite3_column_text(stmt.?, 1),
+            .stage = c.sqlite3_column_text(stmt.?, 2),
+            .company_id = c.sqlite3_column_text(stmt.?, 3),
+        };
     }
 
     fn updateDeal(allocator: std.mem.Allocator, db_inst: *CrmDb, db: *c.sqlite3, existing: DealCandidate, title: []const u8, company_id: ?[]const u8, contact_id: ?[]const u8, stage: []const u8, value: ?f64, currency: ?[]const u8, close_date: ?[]const u8, next_step: ?[]const u8, notes: ?[]const u8) !root.ToolResult {
@@ -464,6 +436,7 @@ test "save_deal duplicate detection" {
     defer std.testing.allocator.free(result.output);
     try std.testing.expect(result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "disambiguation_needed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "Which one did you mean?") != null);
 }
 
 test "save_deal update with stage change" {
