@@ -5,4 +5,5 @@
 //! crm-tools-query).
 
 pub const schema = @import("schema.zig");
+pub const resolve = @import("resolve.zig");
 pub const CrmDb = schema.CrmDb;
