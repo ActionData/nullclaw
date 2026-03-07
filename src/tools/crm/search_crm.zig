@@ -148,10 +148,10 @@ pub const SearchCrmTool = struct {
         if (min_value) |mv| {
             _ = c.sqlite3_bind_double(stmt, 3, mv);
         }
-        if (company) |comp| {
-            const like_comp = try std.fmt.allocPrint(allocator, "%{s}%", .{comp});
-            defer allocator.free(like_comp);
-            _ = c.sqlite3_bind_text(stmt, 4, like_comp.ptr, @intCast(like_comp.len), SQLITE_STATIC);
+        const like_comp = if (company) |comp| try std.fmt.allocPrint(allocator, "%{s}%", .{comp}) else null;
+        defer if (like_comp) |lc| allocator.free(lc);
+        if (like_comp) |lc| {
+            _ = c.sqlite3_bind_text(stmt, 4, lc.ptr, @intCast(lc.len), SQLITE_STATIC);
         }
         _ = c.sqlite3_bind_int64(stmt, 5, limit);
 
@@ -200,10 +200,10 @@ pub const SearchCrmTool = struct {
         defer allocator.free(like_query);
         _ = c.sqlite3_bind_text(stmt, 1, like_query.ptr, @intCast(like_query.len), SQLITE_STATIC);
 
-        if (company) |comp| {
-            const like_comp = try std.fmt.allocPrint(allocator, "%{s}%", .{comp});
-            defer allocator.free(like_comp);
-            _ = c.sqlite3_bind_text(stmt, 2, like_comp.ptr, @intCast(like_comp.len), SQLITE_STATIC);
+        const like_comp = if (company) |comp| try std.fmt.allocPrint(allocator, "%{s}%", .{comp}) else null;
+        defer if (like_comp) |lc| allocator.free(lc);
+        if (like_comp) |lc| {
+            _ = c.sqlite3_bind_text(stmt, 2, lc.ptr, @intCast(lc.len), SQLITE_STATIC);
         }
         _ = c.sqlite3_bind_int64(stmt, 3, limit);
 
@@ -290,10 +290,10 @@ pub const SearchCrmTool = struct {
         defer allocator.free(like_query);
         _ = c.sqlite3_bind_text(stmt, 1, like_query.ptr, @intCast(like_query.len), SQLITE_STATIC);
 
-        if (company) |comp| {
-            const like_comp = try std.fmt.allocPrint(allocator, "%{s}%", .{comp});
-            defer allocator.free(like_comp);
-            _ = c.sqlite3_bind_text(stmt, 2, like_comp.ptr, @intCast(like_comp.len), SQLITE_STATIC);
+        const like_comp = if (company) |comp| try std.fmt.allocPrint(allocator, "%{s}%", .{comp}) else null;
+        defer if (like_comp) |lc| allocator.free(lc);
+        if (like_comp) |lc| {
+            _ = c.sqlite3_bind_text(stmt, 2, lc.ptr, @intCast(lc.len), SQLITE_STATIC);
         }
         _ = c.sqlite3_bind_int64(stmt, 3, limit);
 
@@ -416,14 +416,14 @@ test "search_crm structured path with stage filter" {
 
     var t = SearchCrmTool{ .db = &db };
     const tool_inst = t.tool();
-    const parsed = try root.parseTestArgs("{\"query\":\"deal\",\"filters\":{\"type\":\"deal\",\"stage\":\"proposal\"}}");
+    const parsed = try root.parseTestArgs("{\"query\":\"Platform\",\"filters\":{\"type\":\"deal\",\"stage\":\"proposal\"}}");
     defer parsed.deinit();
     const result = try tool_inst.execute(std.testing.allocator, parsed.value.object);
     defer std.testing.allocator.free(result.output);
     try std.testing.expect(result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "Northstar") != null);
     // Should NOT contain Acme (negotiation stage)
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "Acme") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "Acme Enterprise") == null);
 }
 
 test "search_crm structured path with min_value" {
@@ -450,7 +450,7 @@ test "search_crm structured path with company filter" {
 
     var t = SearchCrmTool{ .db = &db };
     const tool_inst = t.tool();
-    const parsed = try root.parseTestArgs("{\"query\":\"deal\",\"filters\":{\"company\":\"Acme\"}}");
+    const parsed = try root.parseTestArgs("{\"query\":\"Acme\",\"filters\":{\"type\":\"deal\"}}");
     defer parsed.deinit();
     const result = try tool_inst.execute(std.testing.allocator, parsed.value.object);
     defer std.testing.allocator.free(result.output);

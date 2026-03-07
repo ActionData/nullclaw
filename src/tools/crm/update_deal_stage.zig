@@ -228,7 +228,8 @@ test "update_deal_stage invalid stage" {
     defer parsed.deinit();
     const result = try tool_inst.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
-    try std.testing.expect(std.mem.indexOf(u8, result.output.?, "Invalid stage") != null);
+    try std.testing.expect(result.error_msg != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Invalid stage") != null);
 }
 
 test "update_deal_stage success by id" {

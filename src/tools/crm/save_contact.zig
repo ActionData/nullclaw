@@ -32,10 +32,13 @@ pub const SaveContactTool = struct {
         // Resolve company: company_id takes precedence, else search by name
         var resolved_company_id: ?[]const u8 = root.getString(args, "company_id");
         const company_name = root.getString(args, "company");
+        var resolved_company_owned = false;
 
         if (resolved_company_id == null and company_name != null) {
             resolved_company_id = try resolveCompanyByName(allocator, db, company_name.?);
+            if (resolved_company_id != null) resolved_company_owned = true;
         }
+        defer if (resolved_company_owned) if (resolved_company_id) |id| allocator.free(id);
 
         const role = root.getString(args, "role");
         const email = root.getString(args, "email");
@@ -45,7 +48,7 @@ pub const SaveContactTool = struct {
         // Search for existing contacts by name (case-insensitive)
         const candidates = try searchByName(allocator, db, name);
         defer {
-            for (candidates) |cand| allocator.free(cand.id);
+            for (candidates) |cand| freeCandidateFields(allocator, cand);
             allocator.free(candidates);
         }
 
@@ -61,7 +64,6 @@ pub const SaveContactTool = struct {
     }
 
     fn resolveCompanyByName(allocator: std.mem.Allocator, db: *c.sqlite3, name: []const u8) !?[]const u8 {
-        _ = allocator;
         const sql = "SELECT id FROM companies WHERE name = ?1 COLLATE NOCASE LIMIT 1;";
         var stmt: ?*c.sqlite3_stmt = null;
         var rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
@@ -74,15 +76,22 @@ pub const SaveContactTool = struct {
 
         const raw = c.sqlite3_column_text(stmt.?, 0);
         if (raw == null) return null;
-        return std.mem.span(raw);
+        return try allocator.dupe(u8, std.mem.span(raw));
     }
 
     const Candidate = struct {
         id: []const u8,
-        name: [*c]const u8,
-        company_id: [*c]const u8,
-        role: [*c]const u8,
+        name: []const u8,
+        company_id: []const u8,
+        role: []const u8,
     };
+
+    fn freeCandidateFields(allocator: std.mem.Allocator, cand: Candidate) void {
+        allocator.free(cand.id);
+        if (cand.name.len > 0) allocator.free(cand.name);
+        if (cand.company_id.len > 0) allocator.free(cand.company_id);
+        if (cand.role.len > 0) allocator.free(cand.role);
+    }
 
     fn searchByName(allocator: std.mem.Allocator, db: *c.sqlite3, name: []const u8) ![]Candidate {
         const sql = "SELECT id, name, company_id, role FROM contacts WHERE name = ?1 COLLATE NOCASE;";
@@ -95,7 +104,7 @@ pub const SaveContactTool = struct {
 
         var list: std.ArrayList(Candidate) = .empty;
         errdefer {
-            for (list.items) |item| allocator.free(item.id);
+            for (list.items) |item| freeCandidateFields(allocator, item);
             list.deinit(allocator);
         }
 
@@ -103,12 +112,24 @@ pub const SaveContactTool = struct {
             const id_raw = c.sqlite3_column_text(stmt.?, 0);
             if (id_raw == null) continue;
             const id_copy = try allocator.dupe(u8, std.mem.span(id_raw));
+            errdefer allocator.free(id_copy);
+
+            const name_raw = c.sqlite3_column_text(stmt.?, 1);
+            const name_copy = if (name_raw != null) try allocator.dupe(u8, std.mem.span(name_raw)) else "";
+            errdefer if (name_copy.len > 0) allocator.free(name_copy);
+
+            const cid_raw = c.sqlite3_column_text(stmt.?, 2);
+            const cid_copy = if (cid_raw != null) try allocator.dupe(u8, std.mem.span(cid_raw)) else "";
+            errdefer if (cid_copy.len > 0) allocator.free(cid_copy);
+
+            const role_raw = c.sqlite3_column_text(stmt.?, 3);
+            const role_copy = if (role_raw != null) try allocator.dupe(u8, std.mem.span(role_raw)) else "";
 
             try list.append(allocator, .{
                 .id = id_copy,
-                .name = c.sqlite3_column_text(stmt.?, 1),
-                .company_id = c.sqlite3_column_text(stmt.?, 2),
-                .role = c.sqlite3_column_text(stmt.?, 3),
+                .name = name_copy,
+                .company_id = cid_copy,
+                .role = role_copy,
             });
         }
         return list.toOwnedSlice(allocator);
@@ -128,11 +149,11 @@ pub const SaveContactTool = struct {
             try w.writeAll("{\"id\":\"");
             try w.writeAll(cand.id);
             try w.writeAll("\",\"name\":");
-            try helpers.writeNullableJsonC(w, cand.name);
+            try helpers.writeNullableJsonSlice(w, cand.name);
             try w.writeAll(",\"company_id\":");
-            try helpers.writeNullableJsonC(w, cand.company_id);
+            try helpers.writeNullableJsonSlice(w, cand.company_id);
             try w.writeAll(",\"role\":");
-            try helpers.writeNullableJsonC(w, cand.role);
+            try helpers.writeNullableJsonSlice(w, cand.role);
             try w.writeByte('}');
         }
         try w.writeAll("]}");

@@ -264,6 +264,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         .subagent_manager = &subagent_manager,
         .bootstrap_provider = bootstrap_provider,
         .backend_name = cfg.memory.backend,
+        .crm_db_path = cfg.tools.crm_db_path,
     });
     defer tools_mod.deinitTools(allocator, tools);
 

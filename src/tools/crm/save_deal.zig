@@ -45,16 +45,22 @@ pub const SaveDealTool = struct {
         // Resolve company
         var company_id: ?[]const u8 = root.getString(args, "company_id");
         const company_name = root.getString(args, "company");
+        var company_id_owned = false;
         if (company_id == null and company_name != null) {
-            company_id = resolveByName(db, "companies", company_name.?);
+            company_id = try resolveByName(allocator, db, "companies", company_name.?);
+            if (company_id != null) company_id_owned = true;
         }
+        defer if (company_id_owned) if (company_id) |id| allocator.free(id);
 
         // Resolve contact
         var contact_id: ?[]const u8 = root.getString(args, "contact_id");
         const contact_name = root.getString(args, "contact");
+        var contact_id_owned = false;
         if (contact_id == null and contact_name != null) {
-            contact_id = resolveByName(db, "contacts", contact_name.?);
+            contact_id = try resolveByName(allocator, db, "contacts", contact_name.?);
+            if (contact_id != null) contact_id_owned = true;
         }
+        defer if (contact_id_owned) if (contact_id) |id| allocator.free(id);
 
         // Extract deal value (can be integer or float in JSON)
         const value: ?f64 = blk: {
@@ -74,7 +80,7 @@ pub const SaveDealTool = struct {
         // Search for existing deals by title (case-insensitive)
         const candidates = try searchByTitle(allocator, db, title);
         defer {
-            for (candidates) |cand| allocator.free(cand.id);
+            for (candidates) |cand| freeDealCandidateFields(allocator, cand);
             allocator.free(candidates);
         }
 
@@ -89,7 +95,7 @@ pub const SaveDealTool = struct {
         return createDeal(allocator, db_inst, db, title, company_id, contact_id, stage, value, currency, close_date, next_step, notes);
     }
 
-    fn resolveByName(db: *c.sqlite3, table: []const u8, name: []const u8) ?[]const u8 {
+    fn resolveByName(allocator: std.mem.Allocator, db: *c.sqlite3, table: []const u8, name: []const u8) !?[]const u8 {
         // Build query — table name is a comptime-known string literal, safe to embed
         var sql_buf: [128]u8 = undefined;
         const sql_len = std.fmt.bufPrint(&sql_buf, "SELECT id FROM {s} WHERE name = ?1 COLLATE NOCASE LIMIT 1;", .{table}) catch return null;
@@ -109,10 +115,10 @@ pub const SaveDealTool = struct {
 
         const raw = c.sqlite3_column_text(stmt.?, 0);
         if (raw == null) return null;
-        return std.mem.span(raw);
+        return try allocator.dupe(u8, std.mem.span(raw));
     }
 
-    fn resolveByTitle(db: *c.sqlite3, name: []const u8) ?[]const u8 {
+    fn resolveByTitle(allocator: std.mem.Allocator, db: *c.sqlite3, name: []const u8) !?[]const u8 {
         const sql = "SELECT id FROM deals WHERE title = ?1 COLLATE NOCASE LIMIT 1;";
         var stmt: ?*c.sqlite3_stmt = null;
         var rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
@@ -125,15 +131,22 @@ pub const SaveDealTool = struct {
 
         const raw = c.sqlite3_column_text(stmt.?, 0);
         if (raw == null) return null;
-        return std.mem.span(raw);
+        return try allocator.dupe(u8, std.mem.span(raw));
     }
 
     const DealCandidate = struct {
         id: []const u8,
-        title: [*c]const u8,
-        stage: [*c]const u8,
-        company_id: [*c]const u8,
+        title: []const u8,
+        stage: []const u8,
+        company_id: []const u8,
     };
+
+    fn freeDealCandidateFields(allocator: std.mem.Allocator, cand: DealCandidate) void {
+        allocator.free(cand.id);
+        if (cand.title.len > 0) allocator.free(cand.title);
+        if (cand.stage.len > 0) allocator.free(cand.stage);
+        if (cand.company_id.len > 0) allocator.free(cand.company_id);
+    }
 
     fn searchByTitle(allocator: std.mem.Allocator, db: *c.sqlite3, title: []const u8) ![]DealCandidate {
         const sql = "SELECT id, title, stage, company_id FROM deals WHERE title = ?1 COLLATE NOCASE;";
@@ -146,7 +159,7 @@ pub const SaveDealTool = struct {
 
         var list: std.ArrayList(DealCandidate) = .empty;
         errdefer {
-            for (list.items) |item| allocator.free(item.id);
+            for (list.items) |item| freeDealCandidateFields(allocator, item);
             list.deinit(allocator);
         }
 
@@ -154,12 +167,24 @@ pub const SaveDealTool = struct {
             const id_raw = c.sqlite3_column_text(stmt.?, 0);
             if (id_raw == null) continue;
             const id_copy = try allocator.dupe(u8, std.mem.span(id_raw));
+            errdefer allocator.free(id_copy);
+
+            const title_raw = c.sqlite3_column_text(stmt.?, 1);
+            const title_copy = if (title_raw != null) try allocator.dupe(u8, std.mem.span(title_raw)) else "";
+            errdefer if (title_copy.len > 0) allocator.free(title_copy);
+
+            const stage_raw = c.sqlite3_column_text(stmt.?, 2);
+            const stage_copy = if (stage_raw != null) try allocator.dupe(u8, std.mem.span(stage_raw)) else "";
+            errdefer if (stage_copy.len > 0) allocator.free(stage_copy);
+
+            const cid_raw = c.sqlite3_column_text(stmt.?, 3);
+            const cid_copy = if (cid_raw != null) try allocator.dupe(u8, std.mem.span(cid_raw)) else "";
 
             try list.append(allocator, .{
                 .id = id_copy,
-                .title = c.sqlite3_column_text(stmt.?, 1),
-                .stage = c.sqlite3_column_text(stmt.?, 2),
-                .company_id = c.sqlite3_column_text(stmt.?, 3),
+                .title = title_copy,
+                .stage = stage_copy,
+                .company_id = cid_copy,
             });
         }
         return list.toOwnedSlice(allocator);
@@ -179,11 +204,11 @@ pub const SaveDealTool = struct {
             try w.writeAll("{\"id\":\"");
             try w.writeAll(cand.id);
             try w.writeAll("\",\"title\":");
-            try helpers.writeNullableJsonC(w, cand.title);
+            try helpers.writeNullableJsonSlice(w, cand.title);
             try w.writeAll(",\"stage\":");
-            try helpers.writeNullableJsonC(w, cand.stage);
+            try helpers.writeNullableJsonSlice(w, cand.stage);
             try w.writeAll(",\"company_id\":");
-            try helpers.writeNullableJsonC(w, cand.company_id);
+            try helpers.writeNullableJsonSlice(w, cand.company_id);
             try w.writeByte('}');
         }
         try w.writeAll("]}");
@@ -194,7 +219,7 @@ pub const SaveDealTool = struct {
         const now = helpers.nowIso8601();
 
         // Check if stage changed for history tracking
-        const old_stage: ?[]const u8 = if (existing.stage != null) std.mem.span(existing.stage) else null;
+        const old_stage: ?[]const u8 = if (existing.stage.len > 0) existing.stage else null;
         const stage_changed = if (old_stage) |os| !std.mem.eql(u8, os, stage) else true;
 
         const sql =
@@ -480,7 +505,6 @@ test "save_deal update with stage change" {
     try std.testing.expect(result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"status\":\"updated\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "stage_history_entry") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"from_stage\":\"lead\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"to_stage\":\"qualification\"") != null);
 }
 

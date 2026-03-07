@@ -323,6 +323,16 @@ pub fn writeNullableJsonC(w: anytype, raw: [*c]const u8) !void {
     }
 }
 
+pub fn writeNullableJsonSlice(w: anytype, s: []const u8) !void {
+    if (s.len == 0) {
+        try w.writeAll("null");
+    } else {
+        try w.writeByte('"');
+        try writeJsonEscaped(w, s);
+        try w.writeByte('"');
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 test "save_company tool name and description" {

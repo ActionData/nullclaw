@@ -45,23 +45,32 @@ pub const LogActivityTool = struct {
         // Resolve contact
         var contact_id: ?[]const u8 = root.getString(args, "contact_id");
         const contact_name = root.getString(args, "contact");
+        var contact_id_owned = false;
         if (contact_id == null and contact_name != null) {
-            contact_id = resolveByName(db, "contacts", contact_name.?);
+            contact_id = try resolveByName(allocator, db, "contacts", contact_name.?);
+            if (contact_id != null) contact_id_owned = true;
         }
+        defer if (contact_id_owned) if (contact_id) |id| allocator.free(id);
 
         // Resolve deal (by title)
         var deal_id: ?[]const u8 = root.getString(args, "deal_id");
         const deal_title = root.getString(args, "deal");
+        var deal_id_owned = false;
         if (deal_id == null and deal_title != null) {
-            deal_id = resolveByTitle(db, deal_title.?);
+            deal_id = try resolveByTitle(allocator, db, deal_title.?);
+            if (deal_id != null) deal_id_owned = true;
         }
+        defer if (deal_id_owned) if (deal_id) |id| allocator.free(id);
 
         // Resolve company
         var company_id: ?[]const u8 = root.getString(args, "company_id");
         const company_name = root.getString(args, "company");
+        var company_id_owned = false;
         if (company_id == null and company_name != null) {
-            company_id = resolveByName(db, "companies", company_name.?);
+            company_id = try resolveByName(allocator, db, "companies", company_name.?);
+            if (company_id != null) company_id_owned = true;
         }
+        defer if (company_id_owned) if (company_id) |id| allocator.free(id);
 
         const rep_id = root.getString(args, "rep_id");
 
@@ -102,7 +111,7 @@ pub const LogActivityTool = struct {
         return fetchAndReturnActivity(allocator, db, &uuid);
     }
 
-    fn resolveByName(db: *c.sqlite3, table: []const u8, name: []const u8) ?[]const u8 {
+    fn resolveByName(allocator: std.mem.Allocator, db: *c.sqlite3, table: []const u8, name: []const u8) !?[]const u8 {
         var sql_buf: [128]u8 = undefined;
         const sql_len = std.fmt.bufPrint(&sql_buf, "SELECT id FROM {s} WHERE name = ?1 COLLATE NOCASE LIMIT 1;", .{table}) catch return null;
         var sql_z: [129]u8 = undefined;
@@ -120,10 +129,10 @@ pub const LogActivityTool = struct {
 
         const raw = c.sqlite3_column_text(stmt.?, 0);
         if (raw == null) return null;
-        return std.mem.span(raw);
+        return try allocator.dupe(u8, std.mem.span(raw));
     }
 
-    fn resolveByTitle(db: *c.sqlite3, title: []const u8) ?[]const u8 {
+    fn resolveByTitle(allocator: std.mem.Allocator, db: *c.sqlite3, title: []const u8) !?[]const u8 {
         const sql = "SELECT id FROM deals WHERE title = ?1 COLLATE NOCASE LIMIT 1;";
         var stmt: ?*c.sqlite3_stmt = null;
         var rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
@@ -136,7 +145,7 @@ pub const LogActivityTool = struct {
 
         const raw = c.sqlite3_column_text(stmt.?, 0);
         if (raw == null) return null;
-        return std.mem.span(raw);
+        return try allocator.dupe(u8, std.mem.span(raw));
     }
 
     fn fetchAndReturnActivity(allocator: std.mem.Allocator, db: *c.sqlite3, id: []const u8) !root.ToolResult {
