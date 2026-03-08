@@ -10,6 +10,10 @@ pub const Memory = mem_root.Memory;
 pub const MemoryRuntime = mem_root.MemoryRuntime;
 pub const MemoryCategory = mem_root.MemoryCategory;
 
+// Note: Domain tagging ("sales") is applied at the agent/session level by nullclaw,
+// not per memory write. The Memory.store() vtable does not accept domain or metadata params.
+// Metadata is encoded in the text format via [PREFIX] conventions instead.
+
 /// Store a CRM memory entry and trigger vector sync (best-effort).
 /// Failures are silently caught — the CRM SQLite write is authoritative.
 pub fn storeCrmMemory(
@@ -123,10 +127,15 @@ pub fn formatDeal(
     try w.writeByte('.');
 
     if (value) |v| {
+        const cur = currency orelse "USD";
         try w.writeAll(" Value: ");
+        // Prepend $ for USD or unspecified currency
+        if (cur.len == 0 or std.mem.eql(u8, cur, "USD")) {
+            try w.writeByte('$');
+        }
         try std.fmt.format(w, "{d}", .{v});
         try w.writeByte(' ');
-        try w.writeAll(currency orelse "USD");
+        try w.writeAll(if (cur.len == 0) "USD" else cur);
         try w.writeByte('.');
     }
 
@@ -268,7 +277,7 @@ test "formatCompany minimal" {
 test "formatDeal full" {
     const result = try formatDeal(std.testing.allocator, "Platform License", "Northstar", "proposal", 50000.0, "USD", "High priority");
     defer std.testing.allocator.free(result);
-    try std.testing.expectEqualStrings("[DEAL] Platform License with Northstar. Stage: proposal. Value: 50000 USD. High priority", result);
+    try std.testing.expectEqualStrings("[DEAL] Platform License with Northstar. Stage: proposal. Value: $50000 USD. High priority", result);
 }
 
 test "formatDeal minimal" {
@@ -293,6 +302,18 @@ test "formatStageChange" {
     const result = try formatStageChange(std.testing.allocator, "Platform License", "proposal", "negotiation", "SOW sent");
     defer std.testing.allocator.free(result);
     try std.testing.expectEqualStrings("[STAGE] Platform License moved from proposal to negotiation. SOW sent", result);
+}
+
+test "formatFollowUp null contact and company" {
+    const result = try formatFollowUp(std.testing.allocator, null, null, "2026-03-14", "Check in");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("[FOLLOW-UP] Follow-up for  on 2026-03-14: Check in", result);
+}
+
+test "formatActivity null contact and company" {
+    const result = try formatActivity(std.testing.allocator, "meeting", "2026-03-07T10:00:00Z", null, null, "Internal sync");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("[MEETING] 2026-03-07T10:00:00Z: Internal sync", result);
 }
 
 test "formatStageChange no notes" {

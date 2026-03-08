@@ -47,14 +47,21 @@ pub const SaveCompanyTool = struct {
             return buildDisambiguationResponse(allocator, name, candidates);
         }
 
-        const result = if (candidates.len == 1)
-            try updateCompany(allocator, db, candidates[0].id, name, industry, size, website, notes)
-        else
-            try createCompany(allocator, db_inst, db, name, industry, size, website, notes);
+        // Track record ID for memory key (UUID-based for append-only consistency)
+        var record_id: []const u8 = undefined;
+
+        const result = if (candidates.len == 1) blk: {
+            record_id = candidates[0].id;
+            break :blk try updateCompany(allocator, db, candidates[0].id, name, industry, size, website, notes);
+        } else blk: {
+            const uuid = db_inst.generateUuid();
+            record_id = &uuid;
+            break :blk try createCompany(allocator, db, &uuid, name, industry, size, website, notes);
+        };
 
         // Write to memory for RAG (best-effort, failures silently caught)
         if (result.success) if (self.memory) |mem| {
-            const memory_key = std.fmt.allocPrint(allocator, "crm_company_{s}", .{name}) catch null;
+            const memory_key = std.fmt.allocPrint(allocator, "crm_company_{s}", .{record_id}) catch null;
             if (memory_key) |mk| {
                 defer allocator.free(mk);
                 const memory_text = crm_mem.formatCompany(allocator, name, industry, size, notes) catch null;
@@ -187,8 +194,7 @@ pub const SaveCompanyTool = struct {
         return fetchAndReturnCompany(allocator, db, id, "updated", fields_buf.items);
     }
 
-    fn createCompany(allocator: std.mem.Allocator, db_inst: *CrmDb, db: *c.sqlite3, name: []const u8, industry: ?[]const u8, size: ?[]const u8, website: ?[]const u8, notes: ?[]const u8) !root.ToolResult {
-        const uuid = db_inst.generateUuid();
+    fn createCompany(allocator: std.mem.Allocator, db: *c.sqlite3, uuid: []const u8, name: []const u8, industry: ?[]const u8, size: ?[]const u8, website: ?[]const u8, notes: ?[]const u8) !root.ToolResult {
         const now = nowIso8601();
 
         const sql =
@@ -200,7 +206,7 @@ pub const SaveCompanyTool = struct {
         if (rc != c.SQLITE_OK) return root.ToolResult.fail("Failed to prepare insert statement");
         defer _ = c.sqlite3_finalize(stmt);
 
-        _ = c.sqlite3_bind_text(stmt, 1, &uuid, uuid.len, schema.SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 1, uuid.ptr, @intCast(uuid.len), schema.SQLITE_STATIC);
         _ = c.sqlite3_bind_text(stmt, 2, name.ptr, @intCast(name.len), schema.SQLITE_STATIC);
         bindOptionalText(stmt, 3, industry);
         bindOptionalText(stmt, 4, size);
@@ -212,7 +218,7 @@ pub const SaveCompanyTool = struct {
         rc = c.sqlite3_step(stmt.?);
         if (rc != c.SQLITE_DONE) return root.ToolResult.fail("Failed to insert company");
 
-        return fetchAndReturnCompany(allocator, db, &uuid, "created", null);
+        return fetchAndReturnCompany(allocator, db, uuid, "created", null);
     }
 
     fn fetchAndReturnCompany(allocator: std.mem.Allocator, db: *c.sqlite3, id: []const u8, status: []const u8, fields_updated: ?[]const u8) !root.ToolResult {

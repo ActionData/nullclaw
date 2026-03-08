@@ -91,14 +91,21 @@ pub const SaveDealTool = struct {
             return buildDisambiguationResponse(allocator, title, candidates);
         }
 
-        const result = if (candidates.len == 1)
-            try updateDeal(allocator, db_inst, db, candidates[0], title, company_id, contact_id, stage, value, currency, close_date, next_step, notes)
-        else
-            try createDeal(allocator, db_inst, db, title, company_id, contact_id, stage, value, currency, close_date, next_step, notes);
+        // Track record ID for memory key (UUID-based for append-only consistency)
+        var record_id: []const u8 = undefined;
+
+        const result = if (candidates.len == 1) blk: {
+            record_id = candidates[0].id;
+            break :blk try updateDeal(allocator, db_inst, db, candidates[0], title, company_id, contact_id, stage, value, currency, close_date, next_step, notes);
+        } else blk: {
+            const uuid = db_inst.generateUuid();
+            record_id = &uuid;
+            break :blk try createDeal(allocator, db_inst, db, &uuid, title, company_id, contact_id, stage, value, currency, close_date, next_step, notes);
+        };
 
         // Write to memory for RAG (best-effort, failures silently caught)
         if (result.success) if (self.memory) |mem| {
-            const memory_key = std.fmt.allocPrint(allocator, "crm_deal_{s}", .{title}) catch null;
+            const memory_key = std.fmt.allocPrint(allocator, "crm_deal_{s}", .{record_id}) catch null;
             if (memory_key) |mk| {
                 defer allocator.free(mk);
                 const memory_text = crm_mem.formatDeal(allocator, title, company_name, stage, value, currency, notes) catch null;
@@ -285,8 +292,7 @@ pub const SaveDealTool = struct {
         return fetchAndReturnDeal(allocator, db, existing.id, "updated", stage_changed);
     }
 
-    fn createDeal(allocator: std.mem.Allocator, db_inst: *CrmDb, db: *c.sqlite3, title: []const u8, company_id: ?[]const u8, contact_id: ?[]const u8, stage: []const u8, value: ?f64, currency: ?[]const u8, close_date: ?[]const u8, next_step: ?[]const u8, notes: ?[]const u8) !root.ToolResult {
-        const uuid = db_inst.generateUuid();
+    fn createDeal(allocator: std.mem.Allocator, db_inst: *CrmDb, db: *c.sqlite3, uuid: []const u8, title: []const u8, company_id: ?[]const u8, contact_id: ?[]const u8, stage: []const u8, value: ?f64, currency: ?[]const u8, close_date: ?[]const u8, next_step: ?[]const u8, notes: ?[]const u8) !root.ToolResult {
         const now = helpers.nowIso8601();
 
         const sql =
@@ -298,7 +304,7 @@ pub const SaveDealTool = struct {
         if (rc != c.SQLITE_OK) return root.ToolResult.fail("Failed to prepare insert statement");
         defer _ = c.sqlite3_finalize(stmt);
 
-        _ = c.sqlite3_bind_text(stmt, 1, &uuid, uuid.len, schema.SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 1, uuid.ptr, @intCast(uuid.len), schema.SQLITE_STATIC);
         _ = c.sqlite3_bind_text(stmt, 2, title.ptr, @intCast(title.len), schema.SQLITE_STATIC);
         helpers.bindOptionalText(stmt, 3, company_id);
         helpers.bindOptionalText(stmt, 4, contact_id);
@@ -319,9 +325,9 @@ pub const SaveDealTool = struct {
         if (rc != c.SQLITE_DONE) return root.ToolResult.fail("Failed to insert deal");
 
         // Insert initial stage history (from_stage = null)
-        try insertStageHistory(db_inst, db, &uuid, null, stage, &now);
+        try insertStageHistory(db_inst, db, uuid, null, stage, &now);
 
-        return fetchAndReturnDeal(allocator, db, &uuid, "created", true);
+        return fetchAndReturnDeal(allocator, db, uuid, "created", true);
     }
 
     fn insertStageHistory(db_inst: *CrmDb, db: *c.sqlite3, deal_id: []const u8, from_stage: ?[]const u8, to_stage: []const u8, changed_at: []const u8) !void {

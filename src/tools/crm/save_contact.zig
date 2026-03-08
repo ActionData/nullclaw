@@ -59,14 +59,21 @@ pub const SaveContactTool = struct {
             return buildDisambiguationResponse(allocator, name, candidates);
         }
 
-        const result = if (candidates.len == 1)
-            try updateContact(allocator, db, candidates[0].id, name, resolved_company_id, role, email, phone, notes)
-        else
-            try createContact(allocator, db_inst, db, name, resolved_company_id, role, email, phone, notes);
+        // Track record ID for memory key (UUID-based for append-only consistency)
+        var record_id: []const u8 = undefined;
+
+        const result = if (candidates.len == 1) blk: {
+            record_id = candidates[0].id;
+            break :blk try updateContact(allocator, db, candidates[0].id, name, resolved_company_id, role, email, phone, notes);
+        } else blk: {
+            const uuid = db_inst.generateUuid();
+            record_id = &uuid;
+            break :blk try createContact(allocator, db, &uuid, name, resolved_company_id, role, email, phone, notes);
+        };
 
         // Write to memory for RAG (best-effort, failures silently caught)
         if (result.success) if (self.memory) |mem| {
-            const memory_key = std.fmt.allocPrint(allocator, "crm_contact_{s}", .{name}) catch null;
+            const memory_key = std.fmt.allocPrint(allocator, "crm_contact_{s}", .{record_id}) catch null;
             if (memory_key) |mk| {
                 defer allocator.free(mk);
                 const memory_text = crm_mem.formatContact(allocator, name, role, company_name, notes) catch null;
@@ -233,8 +240,7 @@ pub const SaveContactTool = struct {
         return fetchAndReturnContact(allocator, db, id, "updated", fields_buf.items);
     }
 
-    fn createContact(allocator: std.mem.Allocator, db_inst: *CrmDb, db: *c.sqlite3, name: []const u8, company_id: ?[]const u8, role: ?[]const u8, email: ?[]const u8, phone: ?[]const u8, notes: ?[]const u8) !root.ToolResult {
-        const uuid = db_inst.generateUuid();
+    fn createContact(allocator: std.mem.Allocator, db: *c.sqlite3, uuid: []const u8, name: []const u8, company_id: ?[]const u8, role: ?[]const u8, email: ?[]const u8, phone: ?[]const u8, notes: ?[]const u8) !root.ToolResult {
         const now = helpers.nowIso8601();
 
         const sql =
@@ -246,7 +252,7 @@ pub const SaveContactTool = struct {
         if (rc != c.SQLITE_OK) return root.ToolResult.fail("Failed to prepare insert statement");
         defer _ = c.sqlite3_finalize(stmt);
 
-        _ = c.sqlite3_bind_text(stmt, 1, &uuid, uuid.len, schema.SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 1, uuid.ptr, @intCast(uuid.len), schema.SQLITE_STATIC);
         _ = c.sqlite3_bind_text(stmt, 2, name.ptr, @intCast(name.len), schema.SQLITE_STATIC);
         helpers.bindOptionalText(stmt, 3, company_id);
         helpers.bindOptionalText(stmt, 4, role);
@@ -259,7 +265,7 @@ pub const SaveContactTool = struct {
         rc = c.sqlite3_step(stmt.?);
         if (rc != c.SQLITE_DONE) return root.ToolResult.fail("Failed to insert contact");
 
-        return fetchAndReturnContact(allocator, db, &uuid, "created", null);
+        return fetchAndReturnContact(allocator, db, uuid, "created", null);
     }
 
     fn fetchAndReturnContact(allocator: std.mem.Allocator, db: *c.sqlite3, id: []const u8, status: []const u8, fields_updated: ?[]const u8) !root.ToolResult {
