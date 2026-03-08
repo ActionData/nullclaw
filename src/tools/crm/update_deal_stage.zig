@@ -6,9 +6,12 @@ const schema = @import("schema.zig");
 const CrmDb = schema.CrmDb;
 const c = schema.c;
 const SQLITE_STATIC = schema.SQLITE_STATIC;
+const crm_mem = @import("crm_memory.zig");
 
 pub const UpdateDealStageTool = struct {
     db: ?*CrmDb = null,
+    memory: ?crm_mem.Memory = null,
+    mem_rt: ?*crm_mem.MemoryRuntime = null,
 
     pub const tool_name = "update_deal_stage";
     pub const tool_description = "Update a deal's pipeline stage. Validates the stage, records the change in stage_history, and returns the updated deal summary.";
@@ -160,6 +163,19 @@ pub const UpdateDealStageTool = struct {
 
         rc = c.sqlite3_step(hist_stmt.?);
         if (rc != c.SQLITE_DONE) return root.ToolResult.fail("Failed to insert stage history");
+
+        // Write to memory for RAG (best-effort, failures silently caught)
+        if (self.memory) |mem| {
+            const memory_key = std.fmt.allocPrint(allocator, "crm_stage_{s}", .{resolved_id}) catch null;
+            if (memory_key) |mk| {
+                defer allocator.free(mk);
+                const memory_text = crm_mem.formatStageChange(allocator, resolved_title, current_stage, new_stage, notes) catch null;
+                if (memory_text) |mt| {
+                    defer allocator.free(mt);
+                    crm_mem.storeCrmMemory(allocator, mem, self.mem_rt, mk, mt);
+                }
+            }
+        }
 
         const msg = try std.fmt.allocPrint(allocator,
             \\{{"status":"updated","deal":{{"id":"{s}","title":"{s}","stage":"{s}","previous_stage":"{s}"}},"stage_history_entry":{{"id":"{s}","from_stage":"{s}","to_stage":"{s}","notes":"{s}"}}}}

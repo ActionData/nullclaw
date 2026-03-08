@@ -7,9 +7,12 @@ const schema = @import("schema.zig");
 const CrmDb = schema.CrmDb;
 const c = schema.c;
 const helpers = @import("save_company.zig");
+const crm_mem = @import("crm_memory.zig");
 
 pub const SaveDealTool = struct {
     db: ?*CrmDb = null,
+    memory: ?crm_mem.Memory = null,
+    mem_rt: ?*crm_mem.MemoryRuntime = null,
 
     pub const tool_name = "save_deal";
     pub const tool_description = "Create or update a deal in the CRM pipeline. Validates stage against allowed values. Tracks stage changes in history. Resolves company and contact names to IDs.";
@@ -88,11 +91,25 @@ pub const SaveDealTool = struct {
             return buildDisambiguationResponse(allocator, title, candidates);
         }
 
-        if (candidates.len == 1) {
-            return updateDeal(allocator, db_inst, db, candidates[0], title, company_id, contact_id, stage, value, currency, close_date, next_step, notes);
-        }
+        const result = if (candidates.len == 1)
+            try updateDeal(allocator, db_inst, db, candidates[0], title, company_id, contact_id, stage, value, currency, close_date, next_step, notes)
+        else
+            try createDeal(allocator, db_inst, db, title, company_id, contact_id, stage, value, currency, close_date, next_step, notes);
 
-        return createDeal(allocator, db_inst, db, title, company_id, contact_id, stage, value, currency, close_date, next_step, notes);
+        // Write to memory for RAG (best-effort, failures silently caught)
+        if (result.success) if (self.memory) |mem| {
+            const memory_key = std.fmt.allocPrint(allocator, "crm_deal_{s}", .{title}) catch null;
+            if (memory_key) |mk| {
+                defer allocator.free(mk);
+                const memory_text = crm_mem.formatDeal(allocator, title, company_name, stage, value, currency, notes) catch null;
+                if (memory_text) |mt| {
+                    defer allocator.free(mt);
+                    crm_mem.storeCrmMemory(allocator, mem, self.mem_rt, mk, mt);
+                }
+            }
+        };
+
+        return result;
     }
 
     fn resolveByName(allocator: std.mem.Allocator, db: *c.sqlite3, table: []const u8, name: []const u8) !?[]const u8 {

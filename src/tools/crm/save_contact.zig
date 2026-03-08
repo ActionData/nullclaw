@@ -6,9 +6,12 @@ const schema = @import("schema.zig");
 const CrmDb = schema.CrmDb;
 const c = schema.c;
 const helpers = @import("save_company.zig");
+const crm_mem = @import("crm_memory.zig");
 
 pub const SaveContactTool = struct {
     db: ?*CrmDb = null,
+    memory: ?crm_mem.Memory = null,
+    mem_rt: ?*crm_mem.MemoryRuntime = null,
 
     pub const tool_name = "save_contact";
     pub const tool_description = "Create or update a contact in the CRM. Searches for existing contacts by name before creating. Returns disambiguation candidates if multiple matches found.";
@@ -56,11 +59,25 @@ pub const SaveContactTool = struct {
             return buildDisambiguationResponse(allocator, name, candidates);
         }
 
-        if (candidates.len == 1) {
-            return updateContact(allocator, db, candidates[0].id, name, resolved_company_id, role, email, phone, notes);
-        }
+        const result = if (candidates.len == 1)
+            try updateContact(allocator, db, candidates[0].id, name, resolved_company_id, role, email, phone, notes)
+        else
+            try createContact(allocator, db_inst, db, name, resolved_company_id, role, email, phone, notes);
 
-        return createContact(allocator, db_inst, db, name, resolved_company_id, role, email, phone, notes);
+        // Write to memory for RAG (best-effort, failures silently caught)
+        if (result.success) if (self.memory) |mem| {
+            const memory_key = std.fmt.allocPrint(allocator, "crm_contact_{s}", .{name}) catch null;
+            if (memory_key) |mk| {
+                defer allocator.free(mk);
+                const memory_text = crm_mem.formatContact(allocator, name, role, company_name, notes) catch null;
+                if (memory_text) |mt| {
+                    defer allocator.free(mt);
+                    crm_mem.storeCrmMemory(allocator, mem, self.mem_rt, mk, mt);
+                }
+            }
+        };
+
+        return result;
     }
 
     fn resolveCompanyByName(allocator: std.mem.Allocator, db: *c.sqlite3, name: []const u8) !?[]const u8 {

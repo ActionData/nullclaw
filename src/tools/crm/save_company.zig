@@ -5,9 +5,12 @@ const root = @import("../root.zig");
 const schema = @import("schema.zig");
 const CrmDb = schema.CrmDb;
 const c = schema.c;
+const crm_mem = @import("crm_memory.zig");
 
 pub const SaveCompanyTool = struct {
     db: ?*CrmDb = null,
+    memory: ?crm_mem.Memory = null,
+    mem_rt: ?*crm_mem.MemoryRuntime = null,
 
     pub const tool_name = "save_company";
     pub const tool_description = "Create or update a company in the CRM. Searches for existing companies by name before creating. Returns disambiguation candidates if multiple matches found.";
@@ -44,12 +47,25 @@ pub const SaveCompanyTool = struct {
             return buildDisambiguationResponse(allocator, name, candidates);
         }
 
-        if (candidates.len == 1) {
-            return updateCompany(allocator, db, candidates[0].id, name, industry, size, website, notes);
-        }
+        const result = if (candidates.len == 1)
+            try updateCompany(allocator, db, candidates[0].id, name, industry, size, website, notes)
+        else
+            try createCompany(allocator, db_inst, db, name, industry, size, website, notes);
 
-        // No match — create new
-        return createCompany(allocator, db_inst, db, name, industry, size, website, notes);
+        // Write to memory for RAG (best-effort, failures silently caught)
+        if (result.success) if (self.memory) |mem| {
+            const memory_key = std.fmt.allocPrint(allocator, "crm_company_{s}", .{name}) catch null;
+            if (memory_key) |mk| {
+                defer allocator.free(mk);
+                const memory_text = crm_mem.formatCompany(allocator, name, industry, size, notes) catch null;
+                if (memory_text) |mt| {
+                    defer allocator.free(mt);
+                    crm_mem.storeCrmMemory(allocator, mem, self.mem_rt, mk, mt);
+                }
+            }
+        };
+
+        return result;
     }
 
     const Candidate = struct {

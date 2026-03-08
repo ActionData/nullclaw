@@ -503,6 +503,21 @@ pub fn bindMemoryTools(tools: []const Tool, memory: ?Memory) void {
         } else if (t.vtable == &memory_forget.MemoryForgetTool.vtable) {
             const mt: *memory_forget.MemoryForgetTool = @ptrCast(@alignCast(t.ptr));
             mt.memory = memory;
+        } else if (t.vtable == &crm.SaveContactTool.vtable) {
+            const ct: *crm.SaveContactTool = @ptrCast(@alignCast(t.ptr));
+            ct.memory = memory;
+        } else if (t.vtable == &crm.SaveCompanyTool.vtable) {
+            const ct: *crm.SaveCompanyTool = @ptrCast(@alignCast(t.ptr));
+            ct.memory = memory;
+        } else if (t.vtable == &crm.SaveDealTool.vtable) {
+            const ct: *crm.SaveDealTool = @ptrCast(@alignCast(t.ptr));
+            ct.memory = memory;
+        } else if (t.vtable == &crm.LogActivityTool.vtable) {
+            const ct: *crm.LogActivityTool = @ptrCast(@alignCast(t.ptr));
+            ct.memory = memory;
+        } else if (t.vtable == &crm.UpdateDealStageTool.vtable) {
+            const ct: *crm.UpdateDealStageTool = @ptrCast(@alignCast(t.ptr));
+            ct.memory = memory;
         }
     }
 }
@@ -520,6 +535,21 @@ pub fn bindMemoryRuntime(tools: []const Tool, mem_rt: ?*memory_mod.MemoryRuntime
         } else if (t.vtable == &memory_forget.MemoryForgetTool.vtable) {
             const mt: *memory_forget.MemoryForgetTool = @ptrCast(@alignCast(t.ptr));
             mt.mem_rt = mem_rt;
+        } else if (t.vtable == &crm.SaveContactTool.vtable) {
+            const ct: *crm.SaveContactTool = @ptrCast(@alignCast(t.ptr));
+            ct.mem_rt = mem_rt;
+        } else if (t.vtable == &crm.SaveCompanyTool.vtable) {
+            const ct: *crm.SaveCompanyTool = @ptrCast(@alignCast(t.ptr));
+            ct.mem_rt = mem_rt;
+        } else if (t.vtable == &crm.SaveDealTool.vtable) {
+            const ct: *crm.SaveDealTool = @ptrCast(@alignCast(t.ptr));
+            ct.mem_rt = mem_rt;
+        } else if (t.vtable == &crm.LogActivityTool.vtable) {
+            const ct: *crm.LogActivityTool = @ptrCast(@alignCast(t.ptr));
+            ct.mem_rt = mem_rt;
+        } else if (t.vtable == &crm.UpdateDealStageTool.vtable) {
+            const ct: *crm.UpdateDealStageTool = @ptrCast(@alignCast(t.ptr));
+            ct.mem_rt = mem_rt;
         }
     }
 }

@@ -6,6 +6,7 @@
 
 pub const schema = @import("schema.zig");
 pub const resolve = @import("resolve.zig");
+pub const crm_memory = @import("crm_memory.zig");
 pub const CrmDb = schema.CrmDb;
 
 pub const save_contact = @import("save_contact.zig");

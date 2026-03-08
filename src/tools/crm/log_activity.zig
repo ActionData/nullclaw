@@ -7,9 +7,12 @@ const schema = @import("schema.zig");
 const CrmDb = schema.CrmDb;
 const c = schema.c;
 const helpers = @import("save_company.zig");
+const crm_mem = @import("crm_memory.zig");
 
 pub const LogActivityTool = struct {
     db: ?*CrmDb = null,
+    memory: ?crm_mem.Memory = null,
+    mem_rt: ?*crm_mem.MemoryRuntime = null,
 
     pub const tool_name = "log_activity";
     pub const tool_description = "Log an activity (meeting, call, email, or note) in the CRM. Activities are append-only — each call creates a new record. Resolves contact, deal, and company names to IDs.";
@@ -107,6 +110,32 @@ pub const LogActivityTool = struct {
 
         rc = c.sqlite3_step(stmt.?);
         if (rc != c.SQLITE_DONE) return root.ToolResult.fail("Failed to insert activity");
+
+        // Write to memory for RAG (best-effort, failures silently caught)
+        if (self.memory) |mem| {
+            const memory_key = std.fmt.allocPrint(allocator, "crm_activity_{s}", .{&uuid}) catch null;
+            if (memory_key) |mk| {
+                defer allocator.free(mk);
+                const memory_text = crm_mem.formatActivity(allocator, activity_type, date, contact_name, company_name, summary) catch null;
+                if (memory_text) |mt| {
+                    defer allocator.free(mt);
+                    crm_mem.storeCrmMemory(allocator, mem, self.mem_rt, mk, mt);
+                }
+            }
+
+            // Write a second memory entry for follow-ups
+            if (follow_up_date) |fud| {
+                const fu_key = std.fmt.allocPrint(allocator, "crm_followup_{s}", .{&uuid}) catch null;
+                if (fu_key) |fk| {
+                    defer allocator.free(fk);
+                    const fu_text = crm_mem.formatFollowUp(allocator, contact_name, company_name, fud, follow_up_note) catch null;
+                    if (fu_text) |ft| {
+                        defer allocator.free(ft);
+                        crm_mem.storeCrmMemory(allocator, mem, self.mem_rt, fk, ft);
+                    }
+                }
+            }
+        }
 
         return fetchAndReturnActivity(allocator, db, &uuid);
     }
