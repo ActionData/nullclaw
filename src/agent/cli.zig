@@ -278,7 +278,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     // Provider interface from runtime bundle (includes retries/fallbacks).
     const provider_i: Provider = runtime_provider.provider();
 
-    const supports_streaming = provider_i.supportsStreaming();
+    const no_stream_env = std.posix.getenv("NULLCLAW_NO_STREAM") != null;
+    const supports_streaming = provider_i.supportsStreaming() and !no_stream_env;
 
     // Single message mode: nullclaw agent -m "hello"
     if (message_arg) |message| {
@@ -407,21 +408,36 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     }
 
     const stdin = std.fs.File.stdin();
-    var line_buf: [4096]u8 = undefined;
+    var line_buf: [16384]u8 = undefined;
 
     while (true) {
         try w.print("> ", .{});
         try w.flush();
 
-        // Read a line from stdin byte-by-byte
+        // Read lines from stdin, buffering pasted multi-line input.
+        // After each newline, poll stdin briefly to check if more data
+        // is immediately available (pasted text arrives in a burst).
         var pos: usize = 0;
         while (pos < line_buf.len) {
             const n = stdin.read(line_buf[pos .. pos + 1]) catch return;
             if (n == 0) return; // EOF (Ctrl+D)
-            if (line_buf[pos] == '\n') break;
+            if (line_buf[pos] == '\n') {
+                // Check if more input is immediately available (paste buffer)
+                var poll_fds = [_]std.posix.pollfd{.{
+                    .fd = stdin.handle,
+                    .events = std.posix.POLL.IN,
+                    .revents = 0,
+                }};
+                const poll_result = std.posix.poll(&poll_fds, 50) catch 0;
+                if (poll_result == 0) break; // No more data — send message
+                // More data available — replace newline with space and keep reading
+                line_buf[pos] = ' ';
+                pos += 1;
+                continue;
+            }
             pos += 1;
         }
-        const line = line_buf[0..pos];
+        const line = std.mem.trim(u8, line_buf[0..pos], " ");
 
         if (line.len == 0) continue;
         if (cli_mod.CliChannel.isQuitCommand(line)) return;
