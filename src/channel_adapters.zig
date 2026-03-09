@@ -215,6 +215,20 @@ fn deriveMaixcamPeer(input: InboundRouteInput, _: InboundMetadata) ?agent_routin
     return .{ .kind = .direct, .id = input.chat_id };
 }
 
+fn defaultTeamsAccount(config: *const Config, _: []const u8) ?[]const u8 {
+    if (config.channels.teamsPrimary()) |tc| return tc.account_id;
+    return null;
+}
+
+fn deriveTeamsPeer(input: InboundRouteInput, meta: InboundMetadata) ?agent_routing.PeerRef {
+    // Teams personal chats are direct; channel/group chats use the conversation id
+    const is_dm = meta.is_dm orelse (meta.peer_kind == null or meta.peer_kind.? == .direct);
+    return .{
+        .kind = if (is_dm) .direct else .channel,
+        .id = if (is_dm) input.sender_id else input.chat_id,
+    };
+}
+
 fn defaultWebAccount(config: *const Config, _: []const u8) ?[]const u8 {
     if (config.channels.webPrimary()) |wc| return wc.account_id;
     return null;
@@ -266,6 +280,11 @@ pub const inbound_route_descriptors = [_]InboundRouteDescriptor{
         .matches_fn = matchesMaixcam,
         .default_account_id = defaultMaixcamAccount,
         .derive_peer = deriveMaixcamPeer,
+    },
+    .{
+        .channel_name = "teams",
+        .default_account_id = defaultTeamsAccount,
+        .derive_peer = deriveTeamsPeer,
     },
     .{
         .channel_name = "web",

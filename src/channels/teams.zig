@@ -53,14 +53,14 @@ pub const TeamsChannel = struct {
         try url_fbs.writer().print("https://login.microsoftonline.com/{s}/oauth2/v2.0/token", .{self.tenant_id});
         const token_url = url_fbs.getWritten();
 
-        // Build form body
+        // Build form body with URL-encoded values
         var body_list: std.ArrayListUnmanaged(u8) = .empty;
         defer body_list.deinit(self.allocator);
         const bw = body_list.writer(self.allocator);
         try bw.writeAll("grant_type=client_credentials&client_id=");
-        try bw.writeAll(self.client_id);
+        try writeUrlEncoded(bw, self.client_id);
         try bw.writeAll("&client_secret=");
-        try bw.writeAll(self.client_secret);
+        try writeUrlEncoded(bw, self.client_secret);
         try bw.writeAll("&scope=https%3A%2F%2Fapi.botframework.com%2F.default");
 
         const resp = root.http_util.curlPostForm(self.allocator, token_url, body_list.items) catch |err| {
@@ -71,7 +71,7 @@ pub const TeamsChannel = struct {
 
         // Parse JSON response for access_token and expires_in
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp, .{}) catch {
-            log.err("Teams OAuth2: failed to parse token response", .{});
+            log.err("Teams OAuth2: failed to parse token response: {s}", .{resp[0..@min(resp.len, 500)]});
             return error.TeamsTokenError;
         };
         defer parsed.deinit();
@@ -80,7 +80,14 @@ pub const TeamsChannel = struct {
         const obj = parsed.value.object;
 
         const token_val = obj.get("access_token") orelse {
-            log.err("Teams OAuth2: no access_token in response", .{});
+            // Log the error details from Azure AD
+            if (obj.get("error_description")) |desc| {
+                if (desc == .string) log.err("Teams OAuth2 error: {s}", .{desc.string});
+            } else if (obj.get("error")) |err_val| {
+                if (err_val == .string) log.err("Teams OAuth2 error: {s}", .{err_val.string});
+            } else {
+                log.err("Teams OAuth2: no access_token in response: {s}", .{resp[0..@min(resp.len, 500)]});
+            }
             return error.TeamsTokenError;
         };
         if (token_val != .string) return error.TeamsTokenError;
@@ -330,6 +337,22 @@ pub const TeamsChannel = struct {
         // Try to acquire a token
         self.acquireToken() catch return false;
         return self.cached_token != null;
+    }
+
+    /// URL-encode a string for use in application/x-www-form-urlencoded bodies.
+    fn writeUrlEncoded(writer: anytype, input: []const u8) !void {
+        for (input) |c| {
+            switch (c) {
+                'A'...'Z', 'a'...'z', '0'...'9', '-', '_', '.', '*' => try writer.writeByte(c),
+                ' ' => try writer.writeByte('+'),
+                else => {
+                    try writer.writeByte('%');
+                    const hex = "0123456789ABCDEF";
+                    try writer.writeByte(hex[c >> 4]);
+                    try writer.writeByte(hex[c & 0x0F]);
+                },
+            }
+        }
     }
 
     pub const vtable = root.Channel.VTable{
