@@ -2646,7 +2646,8 @@ fn handleTeamsWebhookRoute(ctx: *WebhookHandlerContext) void {
         if (reply) |r| {
             defer ctx.root_allocator.free(r);
             var outbound_ch = channels.teams.TeamsChannel.initFromConfig(ctx.req_allocator, teams_cfg);
-            outbound_ch.sendMessage(service_url, conversation_id, r) catch {};
+            const aid = outbound_ch.sendMessage(service_url, conversation_id, r) catch null;
+            if (aid) |id| ctx.req_allocator.free(id);
         }
     }
 

@@ -27,6 +27,14 @@ pub const TeamsChannel = struct {
     conv_ref_service_url: ?[]u8 = null,
     conv_ref_conversation_id: ?[]u8 = null,
 
+    // Placeholder activity ID cache: maps recipient target → activityId for pending placeholders.
+    placeholder_entries: [MAX_PLACEHOLDER_ENTRIES]?PlaceholderEntry = .{null} ** MAX_PLACEHOLDER_ENTRIES,
+
+    pub const MAX_PLACEHOLDER_ENTRIES = 16;
+    pub const PlaceholderEntry = struct {
+        target: []const u8, // recipient key (not owned — points into caller memory)
+        activity_id: []const u8, // owned by allocator
+    };
     pub const TOKEN_BUFFER_SECS: i64 = 5 * 60; // 5-minute buffer before token expiry
     pub const WEBHOOK_PATH = "/api/messages";
 
@@ -126,7 +134,8 @@ pub const TeamsChannel = struct {
     // ── Outbound Messaging ──────────────────────────────────────────
 
     /// Send a message to a Teams conversation via Bot Framework REST API.
-    pub fn sendMessage(self: *TeamsChannel, service_url: []const u8, conversation_id: []const u8, text: []const u8) !void {
+    /// Returns the activityId from the response (caller-owned), or null if not available.
+    pub fn sendMessage(self: *TeamsChannel, service_url: []const u8, conversation_id: []const u8, text: []const u8) !?[]const u8 {
         const token = try self.getToken();
 
         // Build URL: {serviceUrl}/v3/conversations/{conversationId}/activities
@@ -160,12 +169,64 @@ pub const TeamsChannel = struct {
         };
         defer self.allocator.free(resp);
 
+        // Parse response for activityId and error checking
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp, .{}) catch return null;
+        defer parsed.deinit();
+        if (parsed.value == .object) {
+            if (parsed.value.object.get("error")) |_| {
+                log.err("Teams Bot Framework API returned error", .{});
+                return error.TeamsSendError;
+            }
+            // Extract activityId from response
+            if (parsed.value.object.get("id")) |id_val| {
+                if (id_val == .string) {
+                    return try self.allocator.dupe(u8, id_val.string);
+                }
+            }
+        }
+        return null;
+    }
+
+    /// Update an existing message in a Teams conversation via Bot Framework REST API.
+    pub fn updateMessage(self: *TeamsChannel, service_url: []const u8, conversation_id: []const u8, activity_id: []const u8, text: []const u8) !void {
+        const token = try self.getToken();
+
+        // Build URL: {serviceUrl}/v3/conversations/{conversationId}/activities/{activityId}
+        var url_buf: [512]u8 = undefined;
+        var url_fbs = std.io.fixedBufferStream(&url_buf);
+        const svc = if (service_url.len > 0 and service_url[service_url.len - 1] == '/')
+            service_url[0 .. service_url.len - 1]
+        else
+            service_url;
+        try url_fbs.writer().print("{s}/v3/conversations/{s}/activities/{s}", .{ svc, conversation_id, activity_id });
+        const url = url_fbs.getWritten();
+
+        // Build JSON body
+        var body_list: std.ArrayListUnmanaged(u8) = .empty;
+        defer body_list.deinit(self.allocator);
+        const bw = body_list.writer(self.allocator);
+        try bw.writeAll("{\"type\":\"message\",\"text\":");
+        try root.appendJsonStringW(bw, text);
+        try bw.writeByte('}');
+
+        // Build auth header
+        var auth_buf: [2048]u8 = undefined;
+        var auth_fbs = std.io.fixedBufferStream(&auth_buf);
+        try auth_fbs.writer().print("Authorization: Bearer {s}", .{token});
+        const auth_header = auth_fbs.getWritten();
+
+        const resp = root.http_util.curlPut(self.allocator, url, body_list.items, &.{auth_header}) catch |err| {
+            log.err("Teams Bot Framework PUT (update) failed: {}", .{err});
+            return error.TeamsSendError;
+        };
+        defer self.allocator.free(resp);
+
         // Check for error in response (best-effort)
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp, .{}) catch return;
         defer parsed.deinit();
         if (parsed.value == .object) {
             if (parsed.value.object.get("error")) |_| {
-                log.err("Teams Bot Framework API returned error", .{});
+                log.err("Teams Bot Framework update API returned error", .{});
                 return error.TeamsSendError;
             }
         }
@@ -263,9 +324,44 @@ pub const TeamsChannel = struct {
         };
     }
 
+    // ── Placeholder Cache ──────────────────────────────────────────
+
+    /// Cache a placeholder activityId for a recipient target.
+    fn cachePlaceholder(self: *TeamsChannel, target: []const u8, activity_id: []const u8) void {
+        // Find an empty slot
+        for (&self.placeholder_entries) |*entry| {
+            if (entry.* == null) {
+                entry.* = .{ .target = target, .activity_id = activity_id };
+                return;
+            }
+        }
+        // Cache full — evict first entry (oldest), free its activity_id
+        self.allocator.free(self.placeholder_entries[0].?.activity_id);
+        // Shift entries down
+        for (0..MAX_PLACEHOLDER_ENTRIES - 1) |i| {
+            self.placeholder_entries[i] = self.placeholder_entries[i + 1];
+        }
+        self.placeholder_entries[MAX_PLACEHOLDER_ENTRIES - 1] = .{ .target = target, .activity_id = activity_id };
+    }
+
+    /// Take (get + remove) a cached placeholder activityId for a target. Caller owns returned slice.
+    fn takePlaceholder(self: *TeamsChannel, target: []const u8) ?[]const u8 {
+        for (&self.placeholder_entries) |*entry| {
+            if (entry.*) |e| {
+                if (std.mem.eql(u8, e.target, target)) {
+                    const id = e.activity_id;
+                    entry.* = null;
+                    return id;
+                }
+            }
+        }
+        return null;
+    }
+
     // ── Typing Indicator ──────────────────────────────────────────
 
-    /// Send a typing indicator to a Teams conversation.
+    /// Send a typing indicator and placeholder message to a Teams conversation.
+    /// The placeholder activityId is cached so vtableSend can update it with the real response.
     pub fn startTyping(self: *TeamsChannel, target: []const u8) !void {
         if (!self.running.load(.acquire)) return;
 
@@ -297,11 +393,27 @@ pub const TeamsChannel = struct {
         auth_fbs.writer().print("Authorization: Bearer {s}", .{token}) catch return;
         const auth_header = auth_fbs.getWritten();
 
+        // Send typing indicator
         const resp = root.http_util.curlPost(self.allocator, url, "{\"type\":\"typing\"}", &.{auth_header}) catch |err| {
             log.warn("Teams typing indicator failed: {}", .{err});
             return;
         };
         self.allocator.free(resp);
+
+        // Send placeholder message only in channel threads (where typing indicators don't show).
+        // In DMs, the typing animation provides better UX.
+        // Channel thread conversationIds contain "@thread"; DM conversationIds don't.
+        const is_thread = std.mem.indexOf(u8, conversation_id, "@thread") != null;
+        if (is_thread) {
+            const placeholder_id = self.sendMessage(service_url, conversation_id, "\u{1F914} Working on it...") catch |err| {
+                log.warn("Teams placeholder message failed: {}", .{err});
+                return;
+            };
+            if (placeholder_id) |id| {
+                self.cachePlaceholder(target, id);
+                log.debug("Teams placeholder cached for target, activityId={s}", .{id});
+            }
+        }
     }
 
     /// No-op — Bot Framework typing indicator auto-clears after ~3 seconds.
@@ -345,6 +457,14 @@ pub const TeamsChannel = struct {
             self.conv_ref_conversation_id = null;
         }
 
+        // Free any cached placeholder activity IDs
+        for (&self.placeholder_entries) |*entry| {
+            if (entry.*) |e| {
+                self.allocator.free(e.activity_id);
+                entry.* = null;
+            }
+        }
+
         log.info("Teams channel stopped", .{});
     }
 
@@ -357,14 +477,31 @@ pub const TeamsChannel = struct {
         else
             message;
 
+        // Check for a cached placeholder to update instead of sending a new message
+        if (self.takePlaceholder(target)) |cached_id| {
+            defer self.allocator.free(cached_id);
+            if (std.mem.indexOfScalar(u8, target, '|')) |sep| {
+                const service_url = target[0..sep];
+                const conversation_id = target[sep + 1 ..];
+                self.updateMessage(service_url, conversation_id, cached_id, clean) catch |err| {
+                    log.warn("Teams placeholder update failed, sending new message: {}", .{err});
+                    const activity_id = try self.sendMessage(service_url, conversation_id, clean);
+                    if (activity_id) |id| self.allocator.free(id);
+                };
+                return;
+            }
+        }
+
         // Target format: "serviceUrl|conversationId" or use stored conversation ref for proactive
         if (std.mem.indexOfScalar(u8, target, '|')) |sep| {
             const service_url = target[0..sep];
             const conversation_id = target[sep + 1 ..];
-            try self.sendMessage(service_url, conversation_id, clean);
+            const activity_id = try self.sendMessage(service_url, conversation_id, clean);
+            if (activity_id) |id| self.allocator.free(id);
         } else if (self.conv_ref_service_url != null and self.conv_ref_conversation_id != null) {
             // Proactive: use stored conversation reference
-            try self.sendMessage(self.conv_ref_service_url.?, self.conv_ref_conversation_id.?, clean);
+            const activity_id = try self.sendMessage(self.conv_ref_service_url.?, self.conv_ref_conversation_id.?, clean);
+            if (activity_id) |id| self.allocator.free(id);
         } else {
             log.warn("Teams send: no conversation reference available for target '{s}'", .{target});
         }
@@ -460,6 +597,84 @@ test "vtableSend strips nc_choices tags from message" {
     else
         msg;
     try std.testing.expectEqualStrings("Pick one:\n- Option A\n- Option B", clean);
+}
+
+test "placeholder cache stores and retrieves by target" {
+    var ch = TeamsChannel{
+        .allocator = std.testing.allocator,
+        .client_id = "test-client-id",
+        .client_secret = "test-secret",
+        .tenant_id = "test-tenant",
+    };
+    const target = "https://smba.trafficmanager.net/teams|19:abc@thread.v2";
+    const id = try std.testing.allocator.dupe(u8, "activity-123");
+
+    ch.cachePlaceholder(target, id);
+
+    // takePlaceholder returns the cached ID and removes it
+    const taken = ch.takePlaceholder(target);
+    try std.testing.expect(taken != null);
+    try std.testing.expectEqualStrings("activity-123", taken.?);
+    std.testing.allocator.free(taken.?);
+
+    // Second take returns null (already removed)
+    try std.testing.expect(ch.takePlaceholder(target) == null);
+}
+
+test "placeholder cache returns null for unknown target" {
+    var ch = TeamsChannel{
+        .allocator = std.testing.allocator,
+        .client_id = "test-client-id",
+        .client_secret = "test-secret",
+        .tenant_id = "test-tenant",
+    };
+    try std.testing.expect(ch.takePlaceholder("unknown|target") == null);
+}
+
+test "placeholder cache evicts oldest when full" {
+    var ch = TeamsChannel{
+        .allocator = std.testing.allocator,
+        .client_id = "test-client-id",
+        .client_secret = "test-secret",
+        .tenant_id = "test-tenant",
+    };
+
+    // Fill all slots
+    var ids: [TeamsChannel.MAX_PLACEHOLDER_ENTRIES][]const u8 = undefined;
+    var targets: [TeamsChannel.MAX_PLACEHOLDER_ENTRIES][32]u8 = undefined;
+    for (0..TeamsChannel.MAX_PLACEHOLDER_ENTRIES) |i| {
+        ids[i] = try std.testing.allocator.dupe(u8, "id");
+        var fbs = std.io.fixedBufferStream(&targets[i]);
+        fbs.writer().print("target-{d}", .{i}) catch unreachable;
+        ch.cachePlaceholder(fbs.getWritten(), ids[i]);
+    }
+
+    // Add one more — should evict first entry (target-0)
+    const overflow_id = try std.testing.allocator.dupe(u8, "overflow");
+    ch.cachePlaceholder("target-overflow", overflow_id);
+
+    // target-0's id was freed by eviction; target-1 should still be there
+    var fbs1: [32]u8 = undefined;
+    var fbs1_stream = std.io.fixedBufferStream(&fbs1);
+    fbs1_stream.writer().print("target-{d}", .{1}) catch unreachable;
+    const taken1 = ch.takePlaceholder(fbs1_stream.getWritten());
+    try std.testing.expect(taken1 != null);
+    std.testing.allocator.free(taken1.?);
+
+    // overflow should be there
+    const taken_overflow = ch.takePlaceholder("target-overflow");
+    try std.testing.expect(taken_overflow != null);
+    std.testing.allocator.free(taken_overflow.?);
+
+    // Clean up remaining entries
+    for (2..TeamsChannel.MAX_PLACEHOLDER_ENTRIES) |i| {
+        var tgt_buf: [32]u8 = undefined;
+        var tgt_fbs = std.io.fixedBufferStream(&tgt_buf);
+        tgt_fbs.writer().print("target-{d}", .{i}) catch unreachable;
+        if (ch.takePlaceholder(tgt_fbs.getWritten())) |id| {
+            std.testing.allocator.free(id);
+        }
+    }
 }
 
 test "vtableSend preserves message without nc_choices" {
