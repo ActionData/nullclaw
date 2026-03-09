@@ -655,8 +655,10 @@ fn appendWorkspaceFileContent(
     remaining_bootstrap_chars: *usize,
     hit_total_bootstrap_limit: *bool,
 ) !void {
-    // Read up to BOOTSTRAP_MAX_CHARS + some margin
-    const content = file.readToEndAlloc(allocator, BOOTSTRAP_MAX_CHARS + 1024) catch {
+    // The caller already size-guards workspace bootstrap files to 2 MiB max.
+    // Read the guarded file and let appendPromptSectionContent enforce
+    // per-file and total prompt truncation semantics consistently.
+    const content = file.readToEndAlloc(allocator, @intCast(MAX_WORKSPACE_BOOTSTRAP_FILE_BYTES)) catch {
         try std.fmt.format(w, "### {s}\n\n[Could not read: {s}]\n\n", .{ filename, filename });
         return;
     };
@@ -699,7 +701,7 @@ fn appendPromptSectionContent(
 
     const truncated_by_file = trimmed.len > BOOTSTRAP_MAX_CHARS;
     const truncated_by_total = total_limited_len < file_limited.len;
-    if (truncated_by_file) {
+    if (truncated_by_file and !truncated_by_total) {
         try std.fmt.format(w, "[... truncated at {d} chars -- use `read` for full file]\n\n", .{BOOTSTRAP_MAX_CHARS});
     }
     if (truncated_by_total) {
@@ -1076,6 +1078,81 @@ test "buildSystemPrompt truncates project context at total bootstrap budget" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "user-should-not-appear-after-budget") == null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "### MEMORY.md") == null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "memory-should-not-appear-after-budget") == null);
+}
+
+test "buildSystemPrompt omits per-file truncation marker when total budget stops earlier" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const agents_content = try allocator.alloc(u8, BOOTSTRAP_MAX_CHARS);
+    defer allocator.free(agents_content);
+    @memset(agents_content, 'A');
+
+    const soul_content = try allocator.alloc(u8, BOOTSTRAP_MAX_CHARS + 512);
+    defer allocator.free(soul_content);
+    @memset(soul_content, 'B');
+
+    {
+        const f = try tmp.dir.createFile("AGENTS.md", .{});
+        defer f.close();
+        try f.writeAll(agents_content);
+    }
+    {
+        const f = try tmp.dir.createFile("SOUL.md", .{});
+        defer f.close();
+        try f.writeAll(soul_content);
+    }
+
+    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+
+    const prompt = try buildSystemPrompt(allocator, .{
+        .workspace_dir = workspace,
+        .model_name = "test-model",
+        .tools = &.{},
+    });
+    defer allocator.free(prompt);
+
+    const file_truncation_marker = try std.fmt.allocPrint(
+        allocator,
+        "[... truncated at {d} chars -- use `read` for full file]",
+        .{BOOTSTRAP_MAX_CHARS},
+    );
+    defer allocator.free(file_truncation_marker);
+
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, prompt, file_truncation_marker));
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "[... stopped at project context budget (24000 chars total)]") != null);
+}
+
+test "buildSystemPrompt truncates oversized disk bootstrap files instead of failing read" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const soul_content = try allocator.alloc(u8, BOOTSTRAP_MAX_CHARS + 6_000);
+    defer allocator.free(soul_content);
+    @memset(soul_content, 'S');
+
+    {
+        const f = try tmp.dir.createFile("SOUL.md", .{});
+        defer f.close();
+        try f.writeAll(soul_content);
+    }
+
+    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+
+    const prompt = try buildSystemPrompt(allocator, .{
+        .workspace_dir = workspace,
+        .model_name = "test-model",
+        .tools = &.{},
+    });
+    defer allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "### SOUL.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "[Could not read: SOUL.md]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "[... truncated at 20000 chars -- use `read` for full file]") != null);
 }
 
 test "workspacePromptFingerprint is stable when files are unchanged" {
