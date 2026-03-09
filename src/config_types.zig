@@ -274,6 +274,16 @@ pub const SlackConfig = struct {
     group_policy: []const u8 = "mention_only",
 };
 
+pub const TeamsConfig = struct {
+    account_id: []const u8 = "default",
+    client_id: []const u8,
+    client_secret: []const u8,
+    tenant_id: []const u8,
+    webhook_secret: ?[]const u8 = null,
+    notification_channel_id: ?[]const u8 = null,
+    bot_id: ?[]const u8 = null,
+};
+
 pub const WebhookConfig = struct {
     port: u16 = 8080,
     secret: ?[]const u8 = null,
@@ -647,6 +657,7 @@ pub const ChannelsConfig = struct {
     matrix: []const MatrixConfig = &.{},
     mattermost: []const MattermostConfig = &.{},
     whatsapp: []const WhatsAppConfig = &.{},
+    teams: []const TeamsConfig = &.{},
     irc: []const IrcConfig = &.{},
     lark: []const LarkConfig = &.{},
     dingtalk: []const DingTalkConfig = &.{},
@@ -697,6 +708,9 @@ pub const ChannelsConfig = struct {
     }
     pub fn whatsappPrimary(self: *const ChannelsConfig) ?WhatsAppConfig {
         return primaryAccount(WhatsAppConfig, self.whatsapp);
+    }
+    pub fn teamsPrimary(self: *const ChannelsConfig) ?TeamsConfig {
+        return primaryAccount(TeamsConfig, self.teams);
     }
     pub fn ircPrimary(self: *const ChannelsConfig) ?IrcConfig {
         return primaryAccount(IrcConfig, self.irc);

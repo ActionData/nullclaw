@@ -593,7 +593,7 @@ fn resolveTypingRecipient(
         return std.fmt.allocPrint(allocator, "{s}:{s}", .{ slack_target.channel_id, slack_target.thread_ts }) catch null;
     }
 
-    if (!std.mem.eql(u8, channel_name, "discord") and !std.mem.eql(u8, channel_name, "mattermost")) {
+    if (!std.mem.eql(u8, channel_name, "discord") and !std.mem.eql(u8, channel_name, "mattermost") and !std.mem.eql(u8, channel_name, "teams")) {
         return null;
     }
     if (chat_id.len == 0) return null;
