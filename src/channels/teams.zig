@@ -263,6 +263,48 @@ pub const TeamsChannel = struct {
         };
     }
 
+    // ── Typing Indicator ──────────────────────────────────────────
+
+    /// Send a typing indicator to a Teams conversation.
+    pub fn startTyping(self: *TeamsChannel, target: []const u8) !void {
+        if (!self.running.load(.acquire)) return;
+
+        // Parse target as "serviceUrl|conversationId"
+        const sep = std.mem.indexOfScalar(u8, target, '|') orelse return;
+        const service_url = target[0..sep];
+        const conversation_id = target[sep + 1 ..];
+
+        const token = self.getToken() catch |err| {
+            log.warn("Teams startTyping: failed to get token: {}", .{err});
+            return;
+        };
+
+        // Build URL: {serviceUrl}/v3/conversations/{conversationId}/activities
+        var url_buf: [512]u8 = undefined;
+        var url_fbs = std.io.fixedBufferStream(&url_buf);
+        const svc = if (service_url.len > 0 and service_url[service_url.len - 1] == '/')
+            service_url[0 .. service_url.len - 1]
+        else
+            service_url;
+        url_fbs.writer().print("{s}/v3/conversations/{s}/activities", .{ svc, conversation_id }) catch return;
+        const url = url_fbs.getWritten();
+
+        // Build auth header
+        var auth_buf: [2048]u8 = undefined;
+        var auth_fbs = std.io.fixedBufferStream(&auth_buf);
+        auth_fbs.writer().print("Authorization: Bearer {s}", .{token}) catch return;
+        const auth_header = auth_fbs.getWritten();
+
+        const resp = root.http_util.curlPost(self.allocator, url, "{\"type\":\"typing\"}", &.{auth_header}) catch |err| {
+            log.warn("Teams typing indicator failed: {}", .{err});
+            return;
+        };
+        self.allocator.free(resp);
+    }
+
+    /// No-op — Bot Framework typing indicator auto-clears after ~3 seconds.
+    pub fn stopTyping(_: *TeamsChannel, _: []const u8) !void {}
+
     // ── VTable Implementation ───────────────────────────────────────
 
     fn vtableStart(ptr: *anyopaque) anyerror!void {
@@ -355,15 +397,50 @@ pub const TeamsChannel = struct {
         }
     }
 
+    fn vtableStartTyping(ptr: *anyopaque, recipient: []const u8) anyerror!void {
+        const self: *TeamsChannel = @ptrCast(@alignCast(ptr));
+        return self.startTyping(recipient);
+    }
+
+    fn vtableStopTyping(ptr: *anyopaque, recipient: []const u8) anyerror!void {
+        const self: *TeamsChannel = @ptrCast(@alignCast(ptr));
+        return self.stopTyping(recipient);
+    }
+
     pub const vtable = root.Channel.VTable{
         .start = &vtableStart,
         .stop = &vtableStop,
         .send = &vtableSend,
         .name = &vtableName,
         .healthCheck = &vtableHealthCheck,
+        .startTyping = &vtableStartTyping,
+        .stopTyping = &vtableStopTyping,
     };
 
     pub fn channel(self: *TeamsChannel) root.Channel {
         return .{ .ptr = @ptrCast(self), .vtable = &vtable };
     }
 };
+
+test "Teams startTyping and stopTyping are safe in tests" {
+    var ch = TeamsChannel{
+        .allocator = std.testing.allocator,
+        .client_id = "test-client-id",
+        .client_secret = "test-secret",
+        .tenant_id = "test-tenant",
+    };
+    // startTyping returns immediately when not running (running = false by default)
+    try ch.startTyping("https://smba.trafficmanager.net/teams|19:abc@thread.v2");
+    try ch.stopTyping("https://smba.trafficmanager.net/teams|19:abc@thread.v2");
+}
+
+test "Teams stopTyping is idempotent" {
+    var ch = TeamsChannel{
+        .allocator = std.testing.allocator,
+        .client_id = "test-client-id",
+        .client_secret = "test-secret",
+        .tenant_id = "test-tenant",
+    };
+    try ch.stopTyping("https://smba.trafficmanager.net/teams|19:abc@thread.v2");
+    try ch.stopTyping("https://smba.trafficmanager.net/teams|19:abc@thread.v2");
+}
