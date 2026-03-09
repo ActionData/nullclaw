@@ -6,7 +6,7 @@
 //!   - Body size limits (64KB max)
 //!   - Request timeouts (30s)
 //!   - Bearer token authentication (PairingGuard)
-//!   - Endpoints: /health, /ready, /pair, /webhook, /whatsapp, /telegram, /line, /lark, /qq, /slack/events
+//!   - Endpoints: /health, /ready, /pair, /webhook, /whatsapp, /telegram, /line, /lark, /qq, /slack/events, /api/messages (Teams)
 //!
 //! Uses std.http.Server (built-in, no external deps).
 
@@ -1683,6 +1683,7 @@ const webhook_route_descriptors = [_]WebhookRouteDescriptor{
     .{ .path = "/line", .handler = handleLineWebhookRoute },
     .{ .path = "/lark", .handler = handleLarkWebhookRoute },
     .{ .path = "/qq", .handler = handleQqWebhookRoute },
+    .{ .path = "/api/messages", .handler = handleTeamsWebhookRoute },
 };
 
 fn findWebhookRouteDescriptor(path: []const u8) ?*const WebhookRouteDescriptor {
@@ -2516,6 +2517,196 @@ fn handleQqWebhookRoute(ctx: *WebhookHandlerContext) void {
     }
 
     ctx.response_body = "{\"status\":\"ok\"}";
+}
+
+fn handleTeamsWebhookRoute(ctx: *WebhookHandlerContext) void {
+    if (!build_options.enable_channel_teams) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"teams channel disabled in this build\"}";
+        return;
+    }
+
+    const is_post = std.mem.eql(u8, ctx.method, "POST");
+    if (!is_post) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+
+    if (!ctx.state.rate_limiter.allowWebhook(ctx.state.allocator, "teams")) {
+        ctx.response_status = "429 Too Many Requests";
+        ctx.response_body = "{\"error\":\"rate limited\"}";
+        return;
+    }
+
+    // Get Teams config
+    const config = ctx.config_opt orelse {
+        ctx.response_status = "500 Internal Server Error";
+        ctx.response_body = "{\"error\":\"no config\"}";
+        return;
+    };
+    const teams_cfg = config.channels.teamsPrimary() orelse {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"teams not configured\"}";
+        return;
+    };
+
+    // Verify webhook secret if configured.
+    // TODO: For production, validate the Bot Framework JWT bearer token from the
+    // Authorization header against Microsoft's OpenID metadata instead of using
+    // a custom shared secret. See: https://learn.microsoft.com/en-us/azure/bot-service/rest-api/bot-framework-rest-connector-authentication
+    if (teams_cfg.webhook_secret) |secret| {
+        const header_val = extractHeader(ctx.raw_request, "X-Webhook-Secret");
+        if (header_val == null or !std.mem.eql(u8, std.mem.trim(u8, header_val.?, " \t\r\n"), secret)) {
+            ctx.response_status = "401 Unauthorized";
+            ctx.response_body = "{\"error\":\"unauthorized\"}";
+            return;
+        }
+    }
+
+    const body = extractBody(ctx.raw_request) orelse {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"empty body\"}";
+        return;
+    };
+
+    // Parse Bot Framework Activity JSON
+    const activity_type = jsonStringField(body, "type") orelse {
+        ctx.response_status = "202 Accepted";
+        ctx.response_body = "{\"status\":\"accepted\"}";
+        return;
+    };
+
+    // Only process "message" activities
+    if (!std.mem.eql(u8, activity_type, "message")) {
+        ctx.response_status = "202 Accepted";
+        ctx.response_body = "{\"status\":\"accepted\"}";
+        return;
+    }
+
+    const text = jsonStringField(body, "text") orelse {
+        ctx.response_status = "202 Accepted";
+        ctx.response_body = "{\"status\":\"accepted\"}";
+        return;
+    };
+
+    // Extract conversation.id, from.id, serviceUrl
+    const service_url = jsonStringField(body, "serviceUrl") orelse {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"missing serviceUrl\"}";
+        return;
+    };
+
+    // For nested fields, use manual parsing since jsonStringField doesn't handle nesting
+    const conversation_id = teamsNestedField(body, "conversation", "id") orelse {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"missing conversation.id\"}";
+        return;
+    };
+
+    const from_id = teamsNestedField(body, "from", "id") orelse "unknown";
+
+    // Build session key: teams:{tenant_id}:{conversation_id}
+    var key_buf: [256]u8 = undefined;
+    const sk = std.fmt.bufPrint(&key_buf, "teams:{s}:{s}", .{ teams_cfg.tenant_id, conversation_id }) catch {
+        ctx.response_status = "500 Internal Server Error";
+        ctx.response_body = "{\"error\":\"session key overflow\"}";
+        return;
+    };
+
+    // Build chat_id as "serviceUrl|conversationId" for outbound routing
+    var chat_buf: [512]u8 = undefined;
+    const chat_id = std.fmt.bufPrint(&chat_buf, "{s}|{s}", .{ service_url, conversation_id }) catch {
+        ctx.response_status = "500 Internal Server Error";
+        ctx.response_body = "{\"error\":\"chat_id overflow\"}";
+        return;
+    };
+
+    // Build metadata JSON
+    var meta_buf: [512]u8 = undefined;
+    const metadata = std.fmt.bufPrint(
+        &meta_buf,
+        "{{\"account_id\":\"{s}\",\"service_url\":\"{s}\",\"conversation_id\":\"{s}\",\"from_id\":\"{s}\"}}",
+        .{ teams_cfg.account_id, service_url, conversation_id, from_id },
+    ) catch null;
+
+    // Capture conversation reference if this is the notification channel
+    if (teams_cfg.notification_channel_id) |notif_id| {
+        if (std.mem.eql(u8, conversation_id, notif_id)) {
+            teamsStoreConversationRef(config, service_url, conversation_id);
+        }
+    }
+
+    if (ctx.state.event_bus) |eb| {
+        _ = publishToBus(eb, ctx.state.allocator, "teams", from_id, chat_id, text, sk, metadata);
+    } else if (ctx.session_mgr_opt) |sm| {
+        const reply: ?[]const u8 = sm.processMessage(sk, text, null) catch blk: {
+            break :blk null;
+        };
+        if (reply) |r| {
+            defer ctx.root_allocator.free(r);
+            var outbound_ch = channels.teams.TeamsChannel.initFromConfig(ctx.req_allocator, teams_cfg);
+            outbound_ch.sendMessage(service_url, conversation_id, r) catch {};
+        }
+    }
+
+    ctx.response_status = "202 Accepted";
+    ctx.response_body = "{\"status\":\"accepted\"}";
+}
+
+/// Extract a nested string field from JSON: obj.outer.inner
+fn teamsNestedField(json: []const u8, outer: []const u8, inner: []const u8) ?[]const u8 {
+    // Find the outer object key
+    var needle_buf: [256]u8 = undefined;
+    const quoted_key = std.fmt.bufPrint(&needle_buf, "\"{s}\"", .{outer}) catch return null;
+    const key_pos = std.mem.indexOf(u8, json, quoted_key) orelse return null;
+    const after_key = json[key_pos + quoted_key.len ..];
+
+    // Find the opening brace of the nested object
+    var i: usize = 0;
+    while (i < after_key.len and after_key[i] != '{') : (i += 1) {}
+    if (i >= after_key.len) return null;
+
+    // Find the closing brace (simple — doesn't handle deeply nested)
+    const obj_start = i;
+    var depth: usize = 0;
+    while (i < after_key.len) : (i += 1) {
+        if (after_key[i] == '{') depth += 1;
+        if (after_key[i] == '}') {
+            depth -= 1;
+            if (depth == 0) {
+                i += 1;
+                break;
+            }
+        }
+    }
+    const nested_json = after_key[obj_start..i];
+    return jsonStringField(nested_json, inner);
+}
+
+/// Store Teams conversation reference (serviceUrl + conversationId) to a JSON file
+/// for proactive messaging. Uses config_dir from the config.
+fn teamsStoreConversationRef(config: *const Config, service_url: []const u8, conversation_id: []const u8) void {
+    const config_dir = std.fs.path.dirname(config.config_path) orelse return;
+    var path_buf: [512]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/teams_conversation_ref.json", .{config_dir}) catch return;
+
+    var body_buf: [1024]u8 = undefined;
+    const body = std.fmt.bufPrint(
+        &body_buf,
+        "{{\"serviceUrl\":\"{s}\",\"conversationId\":\"{s}\"}}",
+        .{ service_url, conversation_id },
+    ) catch return;
+
+    const file = std.fs.cwd().createFile(path, .{}) catch |err| {
+        std.log.scoped(.teams).warn("Failed to save conversation reference: {}", .{err});
+        return;
+    };
+    defer file.close();
+    file.writeAll(body) catch |err| {
+        std.log.scoped(.teams).warn("Failed to write conversation reference: {}", .{err});
+    };
+    std.log.scoped(.teams).info("Conversation reference saved to {s}", .{path});
 }
 
 fn applyRuntimeProviderOverrides(config: *const Config) !void {

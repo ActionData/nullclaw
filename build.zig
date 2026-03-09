@@ -72,6 +72,7 @@ const ChannelSelection = struct {
     enable_channel_discord: bool = false,
     enable_channel_slack: bool = false,
     enable_channel_whatsapp: bool = false,
+    enable_channel_teams: bool = false,
     enable_channel_matrix: bool = false,
     enable_channel_mattermost: bool = false,
     enable_channel_irc: bool = false,
@@ -93,6 +94,7 @@ const ChannelSelection = struct {
         self.enable_channel_discord = true;
         self.enable_channel_slack = true;
         self.enable_channel_whatsapp = true;
+        self.enable_channel_teams = true;
         self.enable_channel_matrix = true;
         self.enable_channel_mattermost = true;
         self.enable_channel_irc = true;
@@ -150,6 +152,8 @@ fn parseChannelsOption(raw: []const u8) !ChannelSelection {
             selection.enable_channel_slack = true;
         } else if (std.mem.eql(u8, token, "whatsapp")) {
             selection.enable_channel_whatsapp = true;
+        } else if (std.mem.eql(u8, token, "teams")) {
+            selection.enable_channel_teams = true;
         } else if (std.mem.eql(u8, token, "matrix")) {
             selection.enable_channel_matrix = true;
         } else if (std.mem.eql(u8, token, "mattermost")) {
@@ -389,6 +393,7 @@ pub fn build(b: *std.Build) void {
     const enable_channel_discord = channels.enable_channel_discord;
     const enable_channel_slack = channels.enable_channel_slack;
     const enable_channel_whatsapp = channels.enable_channel_whatsapp;
+    const enable_channel_teams = channels.enable_channel_teams;
     const enable_channel_matrix = channels.enable_channel_matrix;
     const enable_channel_mattermost = channels.enable_channel_mattermost;
     const enable_channel_irc = channels.enable_channel_irc;
@@ -447,6 +452,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "enable_channel_discord", enable_channel_discord);
     build_options.addOption(bool, "enable_channel_slack", enable_channel_slack);
     build_options.addOption(bool, "enable_channel_whatsapp", enable_channel_whatsapp);
+    build_options.addOption(bool, "enable_channel_teams", enable_channel_teams);
     build_options.addOption(bool, "enable_channel_matrix", enable_channel_matrix);
     build_options.addOption(bool, "enable_channel_mattermost", enable_channel_mattermost);
     build_options.addOption(bool, "enable_channel_irc", enable_channel_irc);
