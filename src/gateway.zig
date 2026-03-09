@@ -2551,7 +2551,10 @@ fn handleTeamsWebhookRoute(ctx: *WebhookHandlerContext) void {
         return;
     };
 
-    // Verify webhook secret if configured
+    // Verify webhook secret if configured.
+    // TODO: For production, validate the Bot Framework JWT bearer token from the
+    // Authorization header against Microsoft's OpenID metadata instead of using
+    // a custom shared secret. See: https://learn.microsoft.com/en-us/azure/bot-service/rest-api/bot-framework-rest-connector-authentication
     if (teams_cfg.webhook_secret) |secret| {
         const header_val = extractHeader(ctx.raw_request, "X-Webhook-Secret");
         if (header_val == null or !std.mem.eql(u8, std.mem.trim(u8, header_val.?, " \t\r\n"), secret)) {

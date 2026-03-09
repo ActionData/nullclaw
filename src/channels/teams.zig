@@ -20,7 +20,7 @@ pub const TeamsChannel = struct {
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     // OAuth2 token cache
-    cached_token: ?[]const u8 = null,
+    cached_token: ?[]u8 = null,
     token_expiry: i64 = 0, // epoch seconds
 
     // Conversation reference for proactive messaging (serviceUrl + conversationId)
@@ -102,7 +102,7 @@ pub const TeamsChannel = struct {
         };
 
         // Free old cached token
-        if (self.cached_token) |old| self.allocator.free(@constCast(old));
+        if (self.cached_token) |old| self.allocator.free(old);
 
         // Cache new token
         self.cached_token = try self.allocator.dupe(u8, token_val.string);
@@ -269,7 +269,9 @@ pub const TeamsChannel = struct {
     pub fn startTyping(self: *TeamsChannel, target: []const u8) !void {
         if (!self.running.load(.acquire)) return;
 
-        // Parse target as "serviceUrl|conversationId"
+        // Parse target as "serviceUrl|conversationId".
+        // Proactive messages (stored conv ref) won't have this format — silently skip,
+        // since typing indicators don't make sense for bot-initiated messages.
         const sep = std.mem.indexOfScalar(u8, target, '|') orelse return;
         const service_url = target[0..sep];
         const conversation_id = target[sep + 1 ..];
@@ -331,7 +333,7 @@ pub const TeamsChannel = struct {
         self.running.store(false, .release);
 
         if (self.cached_token) |token| {
-            self.allocator.free(@constCast(token));
+            self.allocator.free(token);
             self.cached_token = null;
         }
         if (self.conv_ref_service_url) |url| {
