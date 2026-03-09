@@ -282,6 +282,8 @@ pub const TeamsConfig = struct {
     webhook_secret: ?[]const u8 = null,
     notification_channel_id: ?[]const u8 = null,
     bot_id: ?[]const u8 = null,
+    enable_reactions: bool = false,
+    reaction_emoji: []const u8 = "like",
 };
 
 pub const WebhookConfig = struct {

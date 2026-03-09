@@ -23,6 +23,14 @@ pub const TeamsChannel = struct {
     cached_token: ?[]u8 = null,
     token_expiry: i64 = 0, // epoch seconds
 
+    // Graph API token cache (separate scope from Bot Framework token)
+    cached_graph_token: ?[]u8 = null,
+    graph_token_expiry: i64 = 0,
+
+    // Reactions config
+    enable_reactions: bool = false,
+    reaction_emoji: []const u8 = "like",
+
     // Conversation reference for proactive messaging (serviceUrl + conversationId)
     conv_ref_service_url: ?[]u8 = null,
     conv_ref_conversation_id: ?[]u8 = null,
@@ -50,6 +58,8 @@ pub const TeamsChannel = struct {
             .webhook_secret = cfg.webhook_secret,
             .notification_channel_id = cfg.notification_channel_id,
             .bot_id = cfg.bot_id,
+            .enable_reactions = cfg.enable_reactions,
+            .reaction_emoji = cfg.reaction_emoji,
         };
     }
 
@@ -131,6 +141,70 @@ pub const TeamsChannel = struct {
         }
         try self.acquireToken();
         return self.cached_token orelse error.TeamsTokenError;
+    }
+
+    /// Acquire a Graph API token from Azure AD (separate scope from Bot Framework).
+    pub fn acquireGraphToken(self: *TeamsChannel) !void {
+        var url_buf: [256]u8 = undefined;
+        var url_fbs = std.io.fixedBufferStream(&url_buf);
+        try url_fbs.writer().print("https://login.microsoftonline.com/{s}/oauth2/v2.0/token", .{self.tenant_id});
+        const token_url = url_fbs.getWritten();
+
+        var body_list: std.ArrayListUnmanaged(u8) = .empty;
+        defer body_list.deinit(self.allocator);
+        const bw = body_list.writer(self.allocator);
+        try bw.writeAll("grant_type=client_credentials&client_id=");
+        try writeUrlEncoded(bw, self.client_id);
+        try bw.writeAll("&client_secret=");
+        try writeUrlEncoded(bw, self.client_secret);
+        try bw.writeAll("&scope=https%3A%2F%2Fgraph.microsoft.com%2F.default");
+
+        const resp = root.http_util.curlPostForm(self.allocator, token_url, body_list.items) catch |err| {
+            log.err("Teams Graph API token request failed: {}", .{err});
+            return error.TeamsTokenError;
+        };
+        defer self.allocator.free(resp);
+
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp, .{}) catch {
+            log.err("Teams Graph API: failed to parse token response", .{});
+            return error.TeamsTokenError;
+        };
+        defer parsed.deinit();
+
+        if (parsed.value != .object) return error.TeamsTokenError;
+        const obj = parsed.value.object;
+
+        const token_val = obj.get("access_token") orelse {
+            if (obj.get("error_description")) |desc| {
+                if (desc == .string) log.err("Teams Graph API OAuth2 error: {s}", .{desc.string});
+            }
+            return error.TeamsTokenError;
+        };
+        if (token_val != .string) return error.TeamsTokenError;
+
+        const expires_in_val = obj.get("expires_in") orelse return error.TeamsTokenError;
+        const expires_in: i64 = switch (expires_in_val) {
+            .integer => expires_in_val.integer,
+            else => return error.TeamsTokenError,
+        };
+
+        if (self.cached_graph_token) |old| self.allocator.free(old);
+        self.cached_graph_token = try self.allocator.dupe(u8, token_val.string);
+        self.graph_token_expiry = std.time.timestamp() + expires_in;
+
+        log.info("Teams Graph API token acquired, expires in {d}s", .{expires_in});
+    }
+
+    /// Get a valid Graph API token, refreshing if necessary.
+    fn getGraphToken(self: *TeamsChannel) ![]const u8 {
+        const now = std.time.timestamp();
+        if (self.cached_graph_token) |token| {
+            if (now < self.graph_token_expiry - TOKEN_BUFFER_SECS) {
+                return token;
+            }
+        }
+        try self.acquireGraphToken();
+        return self.cached_graph_token orelse error.TeamsTokenError;
     }
 
     // ── Outbound Messaging ──────────────────────────────────────────
@@ -329,6 +403,47 @@ pub const TeamsChannel = struct {
         };
     }
 
+    // ── Emoji Reactions (Graph API) ─────────────────────────────────
+
+    /// Add an emoji reaction to a message via Microsoft Graph API.
+    /// Non-fatal: logs warnings on failure, never blocks message processing.
+    pub fn addReaction(self: *TeamsChannel, conversation_id: []const u8, activity_id: []const u8) void {
+        if (!self.enable_reactions) return;
+        if (activity_id.len == 0) return;
+
+        const token = self.getGraphToken() catch |err| {
+            log.warn("Teams addReaction: failed to get Graph token: {}", .{err});
+            return;
+        };
+
+        // Graph API endpoint: POST /chats/{chatId}/messages/{messageId}/setReaction
+        var url_buf: [512]u8 = undefined;
+        var url_fbs = std.io.fixedBufferStream(&url_buf);
+        url_fbs.writer().print("https://graph.microsoft.com/v1.0/chats/{s}/messages/{s}/setReaction", .{
+            conversation_id, activity_id,
+        }) catch return;
+        const url = url_fbs.getWritten();
+
+        // Build JSON body: {"reactionType":"like"}
+        var body_buf: [128]u8 = undefined;
+        var body_fbs = std.io.fixedBufferStream(&body_buf);
+        body_fbs.writer().print("{{\"reactionType\":\"{s}\"}}", .{self.reaction_emoji}) catch return;
+        const body = body_fbs.getWritten();
+
+        // Build auth header
+        var auth_buf: [2048]u8 = undefined;
+        var auth_fbs = std.io.fixedBufferStream(&auth_buf);
+        auth_fbs.writer().print("Authorization: Bearer {s}", .{token}) catch return;
+        const auth_header = auth_fbs.getWritten();
+
+        const resp = root.http_util.curlPost(self.allocator, url, body, &.{auth_header}) catch |err| {
+            log.warn("Teams addReaction Graph API call failed: {}", .{err});
+            return;
+        };
+        self.allocator.free(resp);
+        log.debug("Teams reaction added to message {s}", .{activity_id});
+    }
+
     // ── Placeholder Cache ──────────────────────────────────────────
 
     /// Cache a placeholder activityId for a recipient target. Dupes both target and activity_id.
@@ -482,6 +597,10 @@ pub const TeamsChannel = struct {
         if (self.cached_token) |token| {
             self.allocator.free(token);
             self.cached_token = null;
+        }
+        if (self.cached_graph_token) |token| {
+            self.allocator.free(token);
+            self.cached_graph_token = null;
         }
         if (self.conv_ref_service_url) |url| {
             self.allocator.free(url);
