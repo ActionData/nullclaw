@@ -2606,6 +2606,9 @@ fn handleTeamsWebhookRoute(ctx: *WebhookHandlerContext) void {
 
     const from_id = teamsNestedField(body, "from", "id") orelse "unknown";
 
+    // Extract inbound activity ID (used for emoji reactions in Phase 3)
+    const activity_id = jsonStringField(body, "id") orelse "";
+
     // Build session key: teams:{tenant_id}:{conversation_id}
     var key_buf: [256]u8 = undefined;
     const sk = std.fmt.bufPrint(&key_buf, "teams:{s}:{s}", .{ teams_cfg.tenant_id, conversation_id }) catch {
@@ -2622,12 +2625,12 @@ fn handleTeamsWebhookRoute(ctx: *WebhookHandlerContext) void {
         return;
     };
 
-    // Build metadata JSON
-    var meta_buf: [512]u8 = undefined;
+    // Build metadata JSON (includes activity_id for emoji reactions)
+    var meta_buf: [1024]u8 = undefined;
     const metadata = std.fmt.bufPrint(
         &meta_buf,
-        "{{\"account_id\":\"{s}\",\"service_url\":\"{s}\",\"conversation_id\":\"{s}\",\"from_id\":\"{s}\"}}",
-        .{ teams_cfg.account_id, service_url, conversation_id, from_id },
+        "{{\"account_id\":\"{s}\",\"service_url\":\"{s}\",\"conversation_id\":\"{s}\",\"from_id\":\"{s}\",\"activity_id\":\"{s}\"}}",
+        .{ teams_cfg.account_id, service_url, conversation_id, from_id, activity_id },
     ) catch null;
 
     // Capture conversation reference if this is the notification channel
@@ -2635,6 +2638,12 @@ fn handleTeamsWebhookRoute(ctx: *WebhookHandlerContext) void {
         if (std.mem.eql(u8, conversation_id, notif_id)) {
             teamsStoreConversationRef(config, service_url, conversation_id);
         }
+    }
+
+    // Add emoji reaction to the user's inbound message (non-blocking, best-effort)
+    if (teams_cfg.enable_reactions and activity_id.len > 0) {
+        var reaction_ch = channels.teams.TeamsChannel.initFromConfig(ctx.req_allocator, teams_cfg);
+        reaction_ch.addReaction(conversation_id, activity_id);
     }
 
     if (ctx.state.event_bus) |eb| {
