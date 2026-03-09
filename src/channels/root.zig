@@ -136,6 +136,7 @@ pub const telegram = @import("telegram.zig");
 pub const discord = @import("discord.zig");
 pub const slack = @import("slack.zig");
 pub const whatsapp = @import("whatsapp.zig");
+pub const teams = @import("teams.zig");
 pub const matrix = @import("matrix.zig");
 pub const mattermost = @import("mattermost.zig");
 pub const irc = @import("irc.zig");
