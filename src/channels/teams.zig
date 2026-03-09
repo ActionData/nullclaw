@@ -28,11 +28,13 @@ pub const TeamsChannel = struct {
     conv_ref_conversation_id: ?[]u8 = null,
 
     // Placeholder activity ID cache: maps recipient target → activityId for pending placeholders.
+    // Guarded by placeholder_mutex for thread safety (startTyping and vtableSend may run on different threads).
     placeholder_entries: [MAX_PLACEHOLDER_ENTRIES]?PlaceholderEntry = .{null} ** MAX_PLACEHOLDER_ENTRIES,
+    placeholder_mutex: std.Thread.Mutex = .{},
 
     pub const MAX_PLACEHOLDER_ENTRIES = 16;
     pub const PlaceholderEntry = struct {
-        target: []const u8, // recipient key (not owned — points into caller memory)
+        target: []const u8, // owned by allocator
         activity_id: []const u8, // owned by allocator
     };
     pub const TOKEN_BUFFER_SECS: i64 = 5 * 60; // 5-minute buffer before token expiry
@@ -170,7 +172,10 @@ pub const TeamsChannel = struct {
         defer self.allocator.free(resp);
 
         // Parse response for activityId and error checking
-        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp, .{}) catch return null;
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp, .{}) catch {
+            log.warn("Teams sendMessage: failed to parse response JSON", .{});
+            return null;
+        };
         defer parsed.deinit();
         if (parsed.value == .object) {
             if (parsed.value.object.get("error")) |_| {
@@ -326,30 +331,57 @@ pub const TeamsChannel = struct {
 
     // ── Placeholder Cache ──────────────────────────────────────────
 
-    /// Cache a placeholder activityId for a recipient target.
+    /// Cache a placeholder activityId for a recipient target. Dupes both target and activity_id.
     fn cachePlaceholder(self: *TeamsChannel, target: []const u8, activity_id: []const u8) void {
+        self.placeholder_mutex.lock();
+        defer self.placeholder_mutex.unlock();
+
+        // Check for existing entry with the same target — replace it
+        for (&self.placeholder_entries) |*entry| {
+            if (entry.*) |e| {
+                if (std.mem.eql(u8, e.target, target)) {
+                    self.allocator.free(e.activity_id);
+                    entry.*.?.activity_id = self.allocator.dupe(u8, activity_id) catch return;
+                    return;
+                }
+            }
+        }
+
+        // Dupe both key and value
+        const owned_target = self.allocator.dupe(u8, target) catch return;
+        const owned_id = self.allocator.dupe(u8, activity_id) catch {
+            self.allocator.free(owned_target);
+            return;
+        };
+
         // Find an empty slot
         for (&self.placeholder_entries) |*entry| {
             if (entry.* == null) {
-                entry.* = .{ .target = target, .activity_id = activity_id };
+                entry.* = .{ .target = owned_target, .activity_id = owned_id };
                 return;
             }
         }
-        // Cache full — evict first entry (oldest), free its activity_id
+        // Cache full — evict first entry (FIFO), free its allocations
+        self.allocator.free(self.placeholder_entries[0].?.target);
         self.allocator.free(self.placeholder_entries[0].?.activity_id);
         // Shift entries down
         for (0..MAX_PLACEHOLDER_ENTRIES - 1) |i| {
             self.placeholder_entries[i] = self.placeholder_entries[i + 1];
         }
-        self.placeholder_entries[MAX_PLACEHOLDER_ENTRIES - 1] = .{ .target = target, .activity_id = activity_id };
+        self.placeholder_entries[MAX_PLACEHOLDER_ENTRIES - 1] = .{ .target = owned_target, .activity_id = owned_id };
     }
 
-    /// Take (get + remove) a cached placeholder activityId for a target. Caller owns returned slice.
+    /// Take (get + remove) a cached placeholder activityId for a target.
+    /// Returns the activity_id (caller owns) and frees the target key.
     fn takePlaceholder(self: *TeamsChannel, target: []const u8) ?[]const u8 {
+        self.placeholder_mutex.lock();
+        defer self.placeholder_mutex.unlock();
+
         for (&self.placeholder_entries) |*entry| {
             if (entry.*) |e| {
                 if (std.mem.eql(u8, e.target, target)) {
                     const id = e.activity_id;
+                    self.allocator.free(e.target);
                     entry.* = null;
                     return id;
                 }
@@ -402,7 +434,9 @@ pub const TeamsChannel = struct {
 
         // Send placeholder message only in channel threads (where typing indicators don't show).
         // In DMs, the typing animation provides better UX.
-        // Channel thread conversationIds contain "@thread"; DM conversationIds don't.
+        // Heuristic: channel thread conversationIds contain "@thread" (e.g. "19:...@thread.v2").
+        // DM conversationIds use a different format without this suffix.
+        // If Microsoft changes the format, this degrades gracefully to no-placeholder (DM behavior).
         const is_thread = std.mem.indexOf(u8, conversation_id, "@thread") != null;
         if (is_thread) {
             const placeholder_id = self.sendMessage(service_url, conversation_id, "\u{1F914} Working on it...") catch |err| {
@@ -410,6 +444,7 @@ pub const TeamsChannel = struct {
                 return;
             };
             if (placeholder_id) |id| {
+                defer self.allocator.free(id);
                 self.cachePlaceholder(target, id);
                 log.debug("Teams placeholder cached for target, activityId={s}", .{id});
             }
@@ -457,9 +492,10 @@ pub const TeamsChannel = struct {
             self.conv_ref_conversation_id = null;
         }
 
-        // Free any cached placeholder activity IDs
+        // Free any cached placeholder entries
         for (&self.placeholder_entries) |*entry| {
             if (entry.*) |e| {
+                self.allocator.free(e.target);
                 self.allocator.free(e.activity_id);
                 entry.* = null;
             }
@@ -607,11 +643,11 @@ test "placeholder cache stores and retrieves by target" {
         .tenant_id = "test-tenant",
     };
     const target = "https://smba.trafficmanager.net/teams|19:abc@thread.v2";
-    const id = try std.testing.allocator.dupe(u8, "activity-123");
 
-    ch.cachePlaceholder(target, id);
+    // cachePlaceholder dupes both target and activity_id internally
+    ch.cachePlaceholder(target, "activity-123");
 
-    // takePlaceholder returns the cached ID and removes it
+    // takePlaceholder returns the cached ID (caller owns) and frees the target key
     const taken = ch.takePlaceholder(target);
     try std.testing.expect(taken != null);
     try std.testing.expectEqualStrings("activity-123", taken.?);
@@ -631,6 +667,27 @@ test "placeholder cache returns null for unknown target" {
     try std.testing.expect(ch.takePlaceholder("unknown|target") == null);
 }
 
+test "placeholder cache replaces duplicate target" {
+    var ch = TeamsChannel{
+        .allocator = std.testing.allocator,
+        .client_id = "test-client-id",
+        .client_secret = "test-secret",
+        .tenant_id = "test-tenant",
+    };
+    const target = "https://smba.trafficmanager.net/teams|19:abc@thread.v2";
+
+    ch.cachePlaceholder(target, "first-id");
+    ch.cachePlaceholder(target, "second-id");
+
+    const taken = ch.takePlaceholder(target);
+    try std.testing.expect(taken != null);
+    try std.testing.expectEqualStrings("second-id", taken.?);
+    std.testing.allocator.free(taken.?);
+
+    // Only one entry existed — second take is null
+    try std.testing.expect(ch.takePlaceholder(target) == null);
+}
+
 test "placeholder cache evicts oldest when full" {
     var ch = TeamsChannel{
         .allocator = std.testing.allocator,
@@ -640,20 +697,17 @@ test "placeholder cache evicts oldest when full" {
     };
 
     // Fill all slots
-    var ids: [TeamsChannel.MAX_PLACEHOLDER_ENTRIES][]const u8 = undefined;
     var targets: [TeamsChannel.MAX_PLACEHOLDER_ENTRIES][32]u8 = undefined;
     for (0..TeamsChannel.MAX_PLACEHOLDER_ENTRIES) |i| {
-        ids[i] = try std.testing.allocator.dupe(u8, "id");
         var fbs = std.io.fixedBufferStream(&targets[i]);
         fbs.writer().print("target-{d}", .{i}) catch unreachable;
-        ch.cachePlaceholder(fbs.getWritten(), ids[i]);
+        ch.cachePlaceholder(fbs.getWritten(), "id");
     }
 
     // Add one more — should evict first entry (target-0)
-    const overflow_id = try std.testing.allocator.dupe(u8, "overflow");
-    ch.cachePlaceholder("target-overflow", overflow_id);
+    ch.cachePlaceholder("target-overflow", "overflow");
 
-    // target-0's id was freed by eviction; target-1 should still be there
+    // target-1 should still be there
     var fbs1: [32]u8 = undefined;
     var fbs1_stream = std.io.fixedBufferStream(&fbs1);
     fbs1_stream.writer().print("target-{d}", .{1}) catch unreachable;
