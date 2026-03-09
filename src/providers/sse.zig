@@ -231,7 +231,7 @@ pub fn curlStream(
 
     const term = child.wait() catch |err| {
         log.err("curlStream child.wait failed: {}", .{err});
-        if (saw_done or accumulated.items.len > 0) {
+        if (saw_done) {
             log.warn("curlStream proceeding despite wait failure after receiving stream data", .{});
             callback(ctx, root.StreamChunk.finalChunk());
             return finalizeStreamResult(allocator, accumulated.items, null);
@@ -240,7 +240,7 @@ pub fn curlStream(
     };
     switch (term) {
         .Exited => |code| if (code != 0) {
-            if (saw_done or accumulated.items.len > 0) {
+            if (saw_done) {
                 log.warn("curlStream exit code {d} after stream data; returning accumulated output", .{code});
                 callback(ctx, root.StreamChunk.finalChunk());
                 return finalizeStreamResult(allocator, accumulated.items, null);
@@ -248,7 +248,7 @@ pub fn curlStream(
             return error.CurlFailed;
         },
         else => {
-            if (saw_done or accumulated.items.len > 0) {
+            if (saw_done) {
                 log.warn("curlStream abnormal termination after stream data; returning accumulated output", .{});
                 callback(ctx, root.StreamChunk.finalChunk());
                 return finalizeStreamResult(allocator, accumulated.items, null);
@@ -437,6 +437,7 @@ pub fn curlStreamAnthropic(
 
     var current_event: []const u8 = "";
     var output_tokens: u32 = 0;
+    var saw_done = false;
 
     const file = child.stdout.?;
     var read_buf: [4096]u8 = undefined;
@@ -464,6 +465,7 @@ pub fn curlStreamAnthropic(
                     },
                     .usage => |tokens| output_tokens = tokens,
                     .done => {
+                        saw_done = true;
                         line_buf.clearRetainingCapacity();
                         break :outer;
                     },
@@ -487,7 +489,7 @@ pub fn curlStreamAnthropic(
 
     const term = child.wait() catch |err| {
         log.err("curlStreamAnthropic child.wait failed: {}", .{err});
-        if (accumulated.items.len > 0) {
+        if (saw_done) {
             log.warn("curlStreamAnthropic proceeding despite wait failure after receiving stream data", .{});
             callback(ctx, root.StreamChunk.finalChunk());
             return finalizeStreamResult(allocator, accumulated.items, output_tokens);
@@ -496,7 +498,7 @@ pub fn curlStreamAnthropic(
     };
     switch (term) {
         .Exited => |code| if (code != 0) {
-            if (accumulated.items.len > 0) {
+            if (saw_done) {
                 log.warn("curlStreamAnthropic exit code {d} after stream data; returning accumulated output", .{code});
                 callback(ctx, root.StreamChunk.finalChunk());
                 return finalizeStreamResult(allocator, accumulated.items, output_tokens);
@@ -504,7 +506,7 @@ pub fn curlStreamAnthropic(
             return error.CurlFailed;
         },
         else => {
-            if (accumulated.items.len > 0) {
+            if (saw_done) {
                 log.warn("curlStreamAnthropic abnormal termination after stream data; returning accumulated output", .{});
                 callback(ctx, root.StreamChunk.finalChunk());
                 return finalizeStreamResult(allocator, accumulated.items, output_tokens);

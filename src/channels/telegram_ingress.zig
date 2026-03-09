@@ -17,6 +17,10 @@ fn sameSenderAndChat(a: root.ChannelMessage, b: root.ChannelMessage) bool {
     return std.mem.eql(u8, a.sender, b.sender) and std.mem.eql(u8, a.id, b.id);
 }
 
+fn sameChat(a: root.ChannelMessage, b: root.ChannelMessage) bool {
+    return std.mem.eql(u8, a.sender, b.sender);
+}
+
 fn matchesPendingTextKey(msg: root.ChannelMessage, id: []const u8, sender: []const u8) bool {
     return std.mem.eql(u8, msg.id, id) and std.mem.eql(u8, msg.sender, sender);
 }
@@ -162,7 +166,8 @@ fn findNextMergeCandidateIndex(messages: []const root.ChannelMessage, start: usi
     const current = messages[start];
     for (start + 1..messages.len) |idx| {
         const next = messages[idx];
-        if (!sameSenderAndChat(current, next)) continue;
+        if (!sameChat(current, next)) continue;
+        if (!sameSenderAndChat(current, next)) break;
         if (!hasMessageId(next)) break;
         if (isSlashCommandMessage(next.content)) break;
         return idx;

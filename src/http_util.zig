@@ -307,7 +307,7 @@ pub fn curlPostWithStatus(
 
     const term = child.wait() catch |err| {
         log.err("curl child.wait failed: {}", .{err});
-        return error.CurlWaitError;
+        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
     };
     switch (term) {
         .Exited => |code| if (code != 0) return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed,

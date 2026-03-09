@@ -3589,6 +3589,50 @@ test "telegram mergeConsecutiveMessages handles interleaved chats" {
     try std.testing.expectEqualStrings("Hello from chat 2", messages.items[1].content);
 }
 
+test "telegram mergeConsecutiveMessages stops at interleaved sender in same chat" {
+    const alloc = std.testing.allocator;
+    var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
+    defer {
+        for (messages.items) |msg| {
+            var tmp = msg;
+            tmp.deinit(alloc);
+        }
+        messages.deinit(alloc);
+    }
+
+    try messages.append(alloc, .{
+        .id = try alloc.dupe(u8, "user1"),
+        .sender = try alloc.dupe(u8, "chat1"),
+        .content = try alloc.dupe(u8, "Part 1"),
+        .channel = "telegram",
+        .timestamp = 0,
+        .message_id = 10,
+    });
+    try messages.append(alloc, .{
+        .id = try alloc.dupe(u8, "user2"),
+        .sender = try alloc.dupe(u8, "chat1"),
+        .content = try alloc.dupe(u8, "Interrupting reply"),
+        .channel = "telegram",
+        .timestamp = 0,
+        .message_id = 11,
+    });
+    try messages.append(alloc, .{
+        .id = try alloc.dupe(u8, "user1"),
+        .sender = try alloc.dupe(u8, "chat1"),
+        .content = try alloc.dupe(u8, "Part 2"),
+        .channel = "telegram",
+        .timestamp = 0,
+        .message_id = 12,
+    });
+
+    mergeConsecutiveMessages(alloc, &messages);
+
+    try std.testing.expectEqual(@as(usize, 3), messages.items.len);
+    try std.testing.expectEqualStrings("Part 1", messages.items[0].content);
+    try std.testing.expectEqualStrings("Interrupting reply", messages.items[1].content);
+    try std.testing.expectEqualStrings("Part 2", messages.items[2].content);
+}
+
 test "telegram mergeConsecutiveMessages skips commands" {
     const alloc = std.testing.allocator;
     var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
