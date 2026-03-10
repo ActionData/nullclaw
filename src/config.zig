@@ -269,6 +269,14 @@ pub const Config = struct {
         if (cfg.channels.nostr) |ns| {
             ns.config_dir = std.fs.path.dirname(config_path) orelse ".";
         }
+        // Backfill config_dir for Teams channels (used for conversation reference persistence)
+        {
+            const dir = std.fs.path.dirname(config_path) orelse ".";
+            const teams_mut = @constCast(cfg.channels.teams);
+            for (teams_mut) |*tc| {
+                tc.config_dir = dir;
+            }
+        }
 
         // Environment variable overrides
         cfg.applyEnvOverrides();

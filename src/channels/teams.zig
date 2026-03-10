@@ -7,6 +7,24 @@ const log = std.log.scoped(.teams);
 
 /// Microsoft Teams channel — Bot Framework REST API for outbound, webhook for inbound.
 /// Uses Azure AD OAuth2 client credentials flow for authentication.
+///
+/// ## Teams Conversation ID Formats
+///
+/// Teams uses three different ID formats for the same conversation, depending on context:
+///
+/// 1. **Teams URL format** (`19:...@unq.gbl.spaces`) — visible in Teams deep-links and
+///    the Teams client URL bar. NOT what Bot Framework uses.
+///
+/// 2. **Bot Framework `conversation.id`** (`a:1lFKq...`) — the ID in the Activity JSON
+///    that Bot Framework sends to our webhook. This is the correct value for
+///    `notification_channel_id` in config.json. Used for outbound API calls.
+///
+/// 3. **Session key format** (`29:...`) — sometimes seen in `from.id` or other fields.
+///    NOT the conversation identifier.
+///
+/// When configuring `notification_channel_id`, use the Bot Framework format (type 2).
+/// To discover it, send a message to the bot and check the `conversation.id` field
+/// in the Activity JSON payload received at the `/api/messages` webhook.
 pub const TeamsChannel = struct {
     allocator: std.mem.Allocator,
     account_id: []const u8 = "default",
@@ -22,6 +40,9 @@ pub const TeamsChannel = struct {
     // OAuth2 token cache
     cached_token: ?[]u8 = null,
     token_expiry: i64 = 0, // epoch seconds
+
+    // Config directory for conversation reference file persistence
+    config_dir: []const u8 = ".",
 
     // Conversation reference for proactive messaging (serviceUrl + conversationId)
     conv_ref_service_url: ?[]u8 = null,
@@ -50,6 +71,7 @@ pub const TeamsChannel = struct {
             .webhook_secret = cfg.webhook_secret,
             .notification_channel_id = cfg.notification_channel_id,
             .bot_id = cfg.bot_id,
+            .config_dir = cfg.config_dir,
         };
     }
 
@@ -470,6 +492,11 @@ pub const TeamsChannel = struct {
         // Try to acquire initial token (best-effort — will retry on first send)
         self.acquireToken() catch |err| {
             log.warn("Teams initial token acquisition failed (will retry on send): {}", .{err});
+        };
+
+        // Load saved conversation reference for proactive messaging
+        self.loadConversationRef(self.config_dir) catch |err| {
+            log.warn("Teams conversation ref load failed: {}", .{err});
         };
 
         log.info("Teams channel started", .{});

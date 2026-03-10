@@ -282,6 +282,7 @@ pub const TeamsConfig = struct {
     webhook_secret: ?[]const u8 = null,
     notification_channel_id: ?[]const u8 = null,
     bot_id: ?[]const u8 = null,
+    config_dir: []const u8 = ".",
 };
 
 pub const WebhookConfig = struct {
