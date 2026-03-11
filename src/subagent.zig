@@ -9,6 +9,7 @@ const Allocator = std.mem.Allocator;
 const bus_mod = @import("bus.zig");
 const config_mod = @import("config.zig");
 const config_types = @import("config_types.zig");
+const provider_names = @import("provider_names.zig");
 const providers = @import("providers/root.zig");
 const thread_stacks = @import("thread_stacks.zig");
 
@@ -265,6 +266,15 @@ pub const SubagentManager = struct {
         return null;
     }
 
+    pub fn getTaskErrorMsg(self: *SubagentManager, task_id: u64) ?[]const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.tasks.get(task_id)) |state| {
+            return state.error_msg;
+        }
+        return null;
+    }
+
     pub fn getRunningCount(self: *SubagentManager) u32 {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -361,7 +371,15 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
 
         default_provider = agent_cfg.provider;
         default_model = agent_cfg.model;
-        api_key = agent_cfg.api_key orelse ctx.manager.api_key;
+        api_key = agent_cfg.api_key orelse blk: {
+            // Look up key from configured providers for agent's provider
+            for (ctx.manager.configured_providers) |entry| {
+                if (provider_names.providerNamesMatchIgnoreCase(entry.name, agent_cfg.provider)) {
+                    if (entry.api_key) |k| break :blk k;
+                }
+            }
+            break :blk ctx.manager.api_key;
+        };
         if (agent_cfg.system_prompt) |sp| system_prompt = sp;
         if (agent_cfg.temperature) |t| temperature = t;
     }
