@@ -81,7 +81,7 @@ const all_integrations_list = [_]IntegrationEntry{
     .{ .name = "WhatsApp", .description = "Meta Cloud API via webhook", .category = .chat, .status = .available },
     .{ .name = "Signal", .description = "Privacy-focused via signal-cli", .category = .chat, .status = .coming_soon },
     .{ .name = "iMessage", .description = "macOS AppleScript bridge", .category = .chat, .status = .available },
-    .{ .name = "Microsoft Teams", .description = "Enterprise chat support", .category = .chat, .status = .coming_soon },
+    .{ .name = "Microsoft Teams", .description = "Enterprise chat via Bot Framework", .category = .chat, .status = .available },
     .{ .name = "Matrix", .description = "Matrix protocol (Element)", .category = .chat, .status = .available },
     .{ .name = "Nostr", .description = "Decentralized DMs (NIP-04)", .category = .chat, .status = .coming_soon },
     .{ .name = "WebChat", .description = "Browser-based chat UI", .category = .chat, .status = .coming_soon },

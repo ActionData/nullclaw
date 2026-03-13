@@ -105,11 +105,12 @@ fn openWorkspaceFileWithGuards(
     };
 }
 
-/// Conversation context for the current turn (Signal-specific for now).
+/// Conversation context for the current turn.
 pub const ConversationContext = struct {
     channel: ?[]const u8 = null,
     sender_number: ?[]const u8 = null,
     sender_uuid: ?[]const u8 = null,
+    sender_name: ?[]const u8 = null,
     group_id: ?[]const u8 = null,
     is_group: ?bool = null,
 };
@@ -220,8 +221,15 @@ pub fn buildSystemPrompt(
         if (cc.sender_number) |num| {
             try std.fmt.format(w, "- Sender phone: {s}\n", .{num});
         }
-        if (cc.sender_uuid) |uuid| {
-            try std.fmt.format(w, "- Sender UUID: {s}\n", .{uuid});
+        // Show sender identity: "Sender: Name (UUID)" or just "Sender: (UUID)"
+        if (cc.sender_name) |name| {
+            if (cc.sender_uuid) |uuid| {
+                try std.fmt.format(w, "- Sender: {s} ({s})\n", .{ name, uuid });
+            } else {
+                try std.fmt.format(w, "- Sender: {s}\n", .{name});
+            }
+        } else if (cc.sender_uuid) |uuid| {
+            try std.fmt.format(w, "- Sender: ({s})\n", .{uuid});
         }
         try w.writeAll("\n");
     }

@@ -2539,29 +2539,16 @@ fn handleTeamsWebhookRoute(ctx: *WebhookHandlerContext) void {
         return;
     }
 
-    // Get Teams config
+    // Get config
     const config = ctx.config_opt orelse {
         ctx.response_status = "500 Internal Server Error";
         ctx.response_body = "{\"error\":\"no config\"}";
         return;
     };
-    const teams_cfg = config.channels.teamsPrimary() orelse {
+    if (config.channels.teams.len == 0) {
         ctx.response_status = "404 Not Found";
         ctx.response_body = "{\"error\":\"teams not configured\"}";
         return;
-    };
-
-    // Verify webhook secret if configured.
-    // TODO: For production, validate the Bot Framework JWT bearer token from the
-    // Authorization header against Microsoft's OpenID metadata instead of using
-    // a custom shared secret. See: https://learn.microsoft.com/en-us/azure/bot-service/rest-api/bot-framework-rest-connector-authentication
-    if (teams_cfg.webhook_secret) |secret| {
-        const header_val = extractHeader(ctx.raw_request, "X-Webhook-Secret");
-        if (header_val == null or !std.mem.eql(u8, std.mem.trim(u8, header_val.?, " \t\r\n"), secret)) {
-            ctx.response_status = "401 Unauthorized";
-            ctx.response_body = "{\"error\":\"unauthorized\"}";
-            return;
-        }
     }
 
     const body = extractBody(ctx.raw_request) orelse {
@@ -2590,12 +2577,55 @@ fn handleTeamsWebhookRoute(ctx: *WebhookHandlerContext) void {
         return;
     };
 
-    // Extract conversation.id, from.id, serviceUrl
+    // Extract and validate serviceUrl — this is untrusted input from the webhook payload.
+    // Only allow HTTPS URLs to trusted Bot Framework domains to prevent SSRF.
     const service_url = jsonStringField(body, "serviceUrl") orelse {
         ctx.response_status = "400 Bad Request";
         ctx.response_body = "{\"error\":\"missing serviceUrl\"}";
         return;
     };
+    if (!isValidBotFrameworkServiceUrl(service_url)) {
+        std.log.scoped(.teams).warn("Teams webhook rejected untrusted serviceUrl: {s}", .{service_url});
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"untrusted serviceUrl\"}";
+        return;
+    }
+
+    // Resolve Teams config: match by tenant_id from channelData if multiple
+    // accounts are configured, otherwise fall back to primary.
+    const payload_tenant_id = teamsNestedField(body, "channelData", "tenant") orelse null;
+    const teams_cfg = blk: {
+        if (payload_tenant_id) |tid| {
+            // channelData.tenant may be {"id":"..."} — try extracting the id subfield
+            const resolved_tid = jsonStringField(tid, "id") orelse tid;
+            for (config.channels.teams) |tc| {
+                if (std.mem.eql(u8, tc.tenant_id, resolved_tid)) break :blk tc;
+            }
+        }
+        break :blk config.channels.teamsPrimary() orelse {
+            ctx.response_status = "404 Not Found";
+            ctx.response_body = "{\"error\":\"no matching teams config for tenant\"}";
+            return;
+        };
+    };
+
+    // Verify webhook secret if configured.
+    // TODO: For production, validate the Bot Framework JWT bearer token from the
+    // Authorization header against Microsoft's OpenID metadata instead of using
+    // a custom shared secret. See: https://learn.microsoft.com/en-us/azure/bot-service/rest-api/bot-framework-rest-connector-authentication
+    if (teams_cfg.webhook_secret) |secret| {
+        const header_val = extractHeader(ctx.raw_request, "X-Webhook-Secret");
+        if (header_val == null or !std.mem.eql(u8, std.mem.trim(u8, header_val.?, " \t\r\n"), secret)) {
+            ctx.response_status = "401 Unauthorized";
+            ctx.response_body = "{\"error\":\"unauthorized\"}";
+            return;
+        }
+    } else {
+        // No webhook_secret configured — webhook is open to anyone who knows the URL.
+        // This is acceptable for development but should use webhook_secret or JWT
+        // validation in production deployments.
+        std.log.scoped(.teams).warn("Teams webhook: no webhook_secret configured — request accepted without auth", .{});
+    }
 
     // For nested fields, use manual parsing since jsonStringField doesn't handle nesting
     const conversation_id = teamsNestedField(body, "conversation", "id") orelse {
@@ -2605,6 +2635,7 @@ fn handleTeamsWebhookRoute(ctx: *WebhookHandlerContext) void {
     };
 
     const from_id = teamsNestedField(body, "from", "id") orelse "unknown";
+    const from_name = teamsNestedField(body, "from", "name");
 
     // Build session key: teams:{tenant_id}:{conversation_id}
     var key_buf: [256]u8 = undefined;
@@ -2637,10 +2668,17 @@ fn handleTeamsWebhookRoute(ctx: *WebhookHandlerContext) void {
         }
     }
 
+    const conversation_context: ?@import("agent/prompt.zig").ConversationContext = .{
+        .channel = "teams",
+        .sender_uuid = from_id,
+        .sender_name = from_name,
+        .is_group = false,
+    };
+
     if (ctx.state.event_bus) |eb| {
         _ = publishToBus(eb, ctx.state.allocator, "teams", from_id, chat_id, text, sk, metadata);
     } else if (ctx.session_mgr_opt) |sm| {
-        const reply: ?[]const u8 = sm.processMessage(sk, text, null) catch blk: {
+        const reply: ?[]const u8 = sm.processMessage(sk, text, conversation_context) catch blk: {
             break :blk null;
         };
         if (reply) |r| {
@@ -2659,6 +2697,9 @@ fn handleTeamsWebhookRoute(ctx: *WebhookHandlerContext) void {
 }
 
 /// Extract a nested string field from JSON: obj.outer.inner
+/// Uses jsonStringField on the nested object substring. Handles arbitrary
+/// nesting depth within the outer value by tracking brace depth, and skips
+/// over braces inside JSON string literals to avoid false matches.
 fn teamsNestedField(json: []const u8, outer: []const u8, inner: []const u8) ?[]const u8 {
     // Find the outer object key
     var needle_buf: [256]u8 = undefined;
@@ -2671,12 +2712,25 @@ fn teamsNestedField(json: []const u8, outer: []const u8, inner: []const u8) ?[]c
     while (i < after_key.len and after_key[i] != '{') : (i += 1) {}
     if (i >= after_key.len) return null;
 
-    // Find the closing brace (simple — doesn't handle deeply nested)
+    // Find the matching closing brace, respecting nesting and string literals
     const obj_start = i;
     var depth: usize = 0;
+    var in_string = false;
     while (i < after_key.len) : (i += 1) {
-        if (after_key[i] == '{') depth += 1;
-        if (after_key[i] == '}') {
+        const c = after_key[i];
+        if (in_string) {
+            if (c == '\\' and i + 1 < after_key.len) {
+                i += 1; // skip escaped char
+                continue;
+            }
+            if (c == '"') in_string = false;
+            continue;
+        }
+        if (c == '"') {
+            in_string = true;
+        } else if (c == '{') {
+            depth += 1;
+        } else if (c == '}') {
             depth -= 1;
             if (depth == 0) {
                 i += 1;
@@ -2686,6 +2740,38 @@ fn teamsNestedField(json: []const u8, outer: []const u8, inner: []const u8) ?[]c
     }
     const nested_json = after_key[obj_start..i];
     return jsonStringField(nested_json, inner);
+}
+
+/// Validate that a serviceUrl from a Bot Framework Activity is a trusted Microsoft domain.
+/// Prevents SSRF by only allowing outbound requests to known Bot Framework endpoints.
+fn isValidBotFrameworkServiceUrl(url: []const u8) bool {
+    // Must be HTTPS
+    if (!std.mem.startsWith(u8, url, "https://")) return false;
+
+    // Extract hostname (after "https://", before "/" or ":")
+    const host_start = "https://".len;
+    const rest = url[host_start..];
+    var host_end: usize = rest.len;
+    for (rest, 0..) |c, j| {
+        if (c == '/' or c == ':') {
+            host_end = j;
+            break;
+        }
+    }
+    const host = rest[0..host_end];
+    if (host.len == 0) return false;
+
+    // Allow known Bot Framework service domains
+    const allowed_suffixes = [_][]const u8{
+        ".botframework.com",
+        ".teams.microsoft.com",
+        ".skype.com",
+        ".microsoft.com",
+    };
+    for (allowed_suffixes) |suffix| {
+        if (std.mem.endsWith(u8, host, suffix)) return true;
+    }
+    return false;
 }
 
 /// Store Teams conversation reference (serviceUrl + conversationId) to a JSON file
